@@ -9,7 +9,7 @@ Send and receive WhatsApp messages directly from Emacs — no cloud services, no
 
 - ✅ Send WhatsApp messages from Emacs.
 - 📥 Receive and log incoming messages in the Node.js console.
-- 🖼️ Support for sending images, GIFs, and files (coming soon).
+- 🖼️ Support for sending images, GIFs, and files (coming soon) - usage of .bak files)
 - 🔒 Fully local communication using WhatsApp Web protocol.
 - 🧠 Persistent session — no need to scan QR every time.
 - 💻 Works on GNU/Linux, macOS, and Windows.
