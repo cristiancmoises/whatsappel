@@ -1,4 +1,4 @@
-# 📱 Emacs WhatsApp Integration
+# 📱 WHATSAPPEL - Emacs WhatsApp Integration
 
 A local integration between **Emacs** and **WhatsApp Web**, powered by [Baileys](https://github.com/WhiskeySockets/Baileys) API.  
 Send and receive WhatsApp messages directly from Emacs — no cloud services, no middlemen, fully local and secure.
