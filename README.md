@@ -75,7 +75,7 @@ If all is working, you’ll see:
 
 All incoming messages appear in the Node.js console:
 
-💬 New message from 5599999999999: Hello there!
+💬 New message from 5599999999999: Ae galêraah do Bastizzadôh!
 
 Soon, these will also appear in Emacs buffers.
 
@@ -104,5 +104,4 @@ file for details.
 
 
 > Enjoy messaging from the power of Emacs ⚡
-
-
+> WHY THIS NAME? MEME ORIGINS: https://yt.securityops.co/watch?v=bjAp7uRXBLg
