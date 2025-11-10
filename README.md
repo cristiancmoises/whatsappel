@@ -104,4 +104,3 @@ file for details.
 
 
 > Enjoy messaging from the power of Emacs ⚡
-> WHY THIS NAME? MEME ORIGINS: https://yt.securityops.co/watch?v=bjAp7uRXBLg
