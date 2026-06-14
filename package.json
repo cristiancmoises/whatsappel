@@ -1,0 +1,28 @@
+{
+  "name": "whatsappel-server",
+  "version": "2.6.0",
+  "description": "WhatsApp bridge server for Emacs (whatsapp.el)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node test/test-server.js",
+    "check": "node -c server.js && echo '✓ syntax OK'"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.16",
+    "express": "^4.21.0",
+    "multer": "^1.4.5-lts.1",
+    "pino": "^9.5.0",
+    "qrcode": "^1.5.4",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://codeberg.org/berkeley/whatsappel.git"
+  }
+}

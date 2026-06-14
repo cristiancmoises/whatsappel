@@ -1,0 +1,28 @@
+[Unit]
+Description=WhatsApp.el Bridge Server (Baileys)
+Documentation=https://codeberg.org/berkeley/whatsappel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/whatsappel
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=5
+
+Environment=WAEL_PORT=3000
+Environment=WAEL_WS_PORT=3001
+Environment=WAEL_AUTH_DIR=%h/.local/share/whatsappel/auth_info
+Environment=WAEL_MEDIA_DIR=%h/.local/share/whatsappel/media
+Environment=WAEL_STORE_FILE=%h/.local/share/whatsappel/store.json
+Environment=WAEL_LOG_LEVEL=warn
+Environment=NODE_ENV=production
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/whatsappel
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,20 @@
+services:
+  whatsappel:
+    build: .
+    container_name: whatsappel
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"   # REST API
+      - "127.0.0.1:3001:3001"   # WebSocket
+    volumes:
+      - whatsappel-data:/data
+    environment:
+      - WAEL_LOG_LEVEL=info
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  whatsappel-data:
