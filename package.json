@@ -1,6 +1,6 @@
 {
   "name": "whatsappel-server",
-  "version": "2.6.0",
+  "version": "2.7.2",
   "description": "WhatsApp bridge server for Emacs (whatsapp.el)",
   "main": "server.js",
   "scripts": {
@@ -21,8 +21,12 @@
     "node": ">=18.0.0"
   },
   "license": "GPL-3.0-only",
+  "homepage": "https://git.securityops.co/cristiancmoises/whatsappel",
   "repository": {
     "type": "git",
-    "url": "https://codeberg.org/berkeley/whatsappel.git"
+    "url": "https://git.securityops.co/cristiancmoises/whatsappel.git"
+  },
+  "bugs": {
+    "url": "https://git.securityops.co/cristiancmoises/whatsappel/issues"
   }
 }

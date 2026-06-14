@@ -1,6 +1,6 @@
 [Unit]
 Description=WhatsApp.el Bridge Server (Baileys)
-Documentation=https://codeberg.org/berkeley/whatsappel
+Documentation=https://git.securityops.co/cristiancmoises/whatsappel
 After=network-online.target
 Wants=network-online.target
 
