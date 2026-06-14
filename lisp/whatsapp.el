@@ -2,10 +2,15 @@
 
 ;; Copyright (C) 2025 berkeley, Cristian Cezar Moisés
 ;; Author: berkeley, Cristian Cezar Moisés
-;; URL: https://codeberg.org/berkeley/whatsappel
+;; URL: https://git.securityops.co/cristiancmoises/whatsappel
 ;; Version: 2.7.2
 ;; Package-Requires: ((emacs "28.1") (websocket "1.14"))
 ;; Keywords: comm, chat, whatsapp
+
+;; Official repositories (Forgejo + Codeberg); GitHub is a mirror:
+;;   Forgejo (primary):  https://git.securityops.co/cristiancmoises/whatsappel
+;;   Codeberg:           https://codeberg.org/berkeley/whatsappel
+;;   GitHub (mirror):    https://github.com/cristiancmoises/whatsappel
 
 ;; This program is free software: you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by

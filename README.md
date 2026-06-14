@@ -5,6 +5,21 @@ Send and receive WhatsApp messages directly from Emacs — no cloud services, no
 
 ---
 
+## 📦 Repositories
+
+**Official** (development happens here):
+
+- Forgejo (primary): <https://git.securityops.co/cristiancmoises/whatsappel>
+- Codeberg: <https://codeberg.org/berkeley/whatsappel>
+
+**Mirror** (read-only):
+
+- GitHub: <https://github.com/cristiancmoises/whatsappel>
+
+Please open issues and pull requests on the **Forgejo** or **Codeberg** repositories.
+
+---
+
 ## 🚀 Features
 
 - ✅ Send WhatsApp messages from Emacs.
