@@ -21,6 +21,19 @@ All notable changes to WhatsApp.el are documented here.
 - Read/edit/delete use proper message keys (work in groups & `@lid` chats).
 - Atomic store writes, debounced saves/broadcasts, async (non-blocking) avatars/media.
 
+### Changed
+- Canonical project URLs now point to the official Forgejo repo
+  (`git.securityops.co/cristiancmoises/whatsappel`); Codeberg is co-official and
+  GitHub is a read-only mirror. Updated `whatsapp.el` header, `package.json`
+  (bumped to 2.7.2, with `homepage`/`repository`/`bugs`), and `whatsappel.service`.
+
+### Documentation
+- Rewrote `README.md`: project logo, accurate feature list, architecture diagram,
+  install/usage guides, full keybinding & configuration reference, privacy notes,
+  an author's note, and a Repositories (official vs mirror) section.
+- Shipped a ready-to-copy example `init.el` and kept the full bridge/API reference
+  under `docs/BRIDGE.md`.
+
 ## [2.7.0] — 2026-05-25
 
 ### Added
