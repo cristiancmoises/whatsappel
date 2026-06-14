@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Private WhatsApp session + data — NEVER commit these
+auth_info/
+store.json
+store.json.*
+data/
+media/
+
+# Logs and backups
+*.log
+bridge.log
+*.bak
+
+# Emacs
+*.elc
+*~
+\#*\#
+.\#*

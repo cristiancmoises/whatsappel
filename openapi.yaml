@@ -1,0 +1,280 @@
+openapi: "3.1.0"
+info:
+  title: WhatsApp.el Bridge API
+  version: "2.6.0"
+  description: REST API for the whatsappel Emacs WhatsApp client bridge server
+  license:
+    name: GPL-3.0
+    url: https://www.gnu.org/licenses/gpl-3.0.html
+
+servers:
+  - url: http://localhost:3000/api/v1
+    description: Local bridge server
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Optional. Set WAEL_API_TOKEN to enable.
+
+  schemas:
+    Message:
+      type: object
+      properties:
+        id: { type: string }
+        jid: { type: string }
+        fromMe: { type: boolean }
+        sender: { type: string }
+        senderName: { type: string }
+        text: { type: string }
+        type: { type: string, enum: [text, image, video, audio, document, sticker, location, contact, poll] }
+        timestamp: { type: integer }
+        status: { type: integer, enum: [0, 1, 2, 3, 4] }
+        quotedId: { type: string, nullable: true }
+        quotedText: { type: string, nullable: true }
+        deleted: { type: boolean }
+        edited: { type: boolean }
+        starred: { type: boolean }
+        hasMedia: { type: boolean }
+        mimetype: { type: string }
+        fileName: { type: string }
+        fileLength: { type: integer }
+        seconds: { type: integer }
+        reactions: { type: array, items: { type: object, properties: { emoji: { type: string }, count: { type: integer } } } }
+        linkPreview: { type: object, nullable: true, properties: { url: { type: string }, title: { type: string }, description: { type: string } } }
+
+    Chat:
+      type: object
+      properties:
+        jid: { type: string }
+        name: { type: string }
+        unreadCount: { type: integer }
+        pinned: { type: boolean }
+        muted: { type: boolean }
+        archived: { type: boolean }
+        isGroup: { type: boolean }
+        timestamp: { type: integer }
+        lastMessage: { type: object, properties: { text: { type: string }, timestamp: { type: integer }, fromMe: { type: boolean } } }
+
+    Contact:
+      type: object
+      properties:
+        jid: { type: string }
+        name: { type: string }
+        pushName: { type: string }
+        imgUrl: { type: string, nullable: true }
+        status: { type: string }
+
+paths:
+  /health:
+    get:
+      summary: Server health check
+      responses: { "200": { description: OK } }
+
+  /session/status:
+    get:
+      summary: Connection state
+      responses: { "200": { description: Connection status with QR availability } }
+
+  /session/qr:
+    get:
+      summary: QR code for pairing
+      parameters:
+        - name: format
+          in: query
+          schema: { type: string, enum: [base64, png], default: base64 }
+      responses: { "200": { description: QR code data } }
+
+  /session/me:
+    get:
+      summary: Own JID and name
+      responses: { "200": { description: User info } }
+
+  /session/logout:
+    post:
+      summary: Disconnect and clear session
+      responses: { "200": { description: Logged out } }
+
+  /chats:
+    get:
+      summary: List all chats sorted by activity
+      responses: { "200": { description: Array of Chat objects } }
+
+  /chats/archive:
+    post:
+      summary: Archive or unarchive a chat
+      requestBody: { content: { "application/json": { schema: { type: object, properties: { jid: { type: string }, archive: { type: boolean } } } } } }
+
+  /chats/mute:
+    post:
+      summary: Mute or unmute a chat
+      requestBody: { content: { "application/json": { schema: { type: object, properties: { jid: { type: string }, mute: { type: boolean }, duration: { type: integer } } } } } }
+
+  /chats/pin:
+    post:
+      summary: Pin or unpin a chat
+
+  /chats/read-all:
+    post:
+      summary: Mark all chats as read
+
+  /chats/{jid}:
+    delete:
+      summary: Delete a chat
+
+  /chats/{jid}/export:
+    get:
+      summary: Export chat history
+      parameters:
+        - { name: jid, in: path, required: true, schema: { type: string } }
+        - { name: format, in: query, schema: { type: string, enum: [text, json], default: text } }
+        - { name: limit, in: query, schema: { type: integer, default: 500 } }
+
+  /chats/{jid}/stats:
+    get:
+      summary: Chat statistics
+
+  /contacts:
+    get:
+      summary: List all contacts
+
+  /contacts/{jid}:
+    get:
+      summary: Contact info with status and profile pic
+
+  /contacts/{jid}/avatar:
+    get:
+      summary: Profile picture URL
+
+  /contacts/avatars:
+    get:
+      summary: Batch profile picture URLs
+      parameters:
+        - { name: jids, in: query, schema: { type: string, description: Comma-separated JIDs } }
+
+  /messages/send/text:
+    post:
+      summary: Send text message
+      requestBody: { content: { "application/json": { schema: { type: object, required: [jid, text], properties: { jid: { type: string }, text: { type: string }, quotedMsgId: { type: string } } } } } }
+
+  /messages/send/media:
+    post:
+      summary: Send file (image/video/audio/document)
+      requestBody: { content: { "multipart/form-data": { schema: { type: object, properties: { file: { type: string, format: binary }, jid: { type: string }, caption: { type: string }, mimetype: { type: string } } } } } }
+
+  /messages/send/location:
+    post:
+      summary: Send location
+      requestBody: { content: { "application/json": { schema: { type: object, required: [jid, lat, lon], properties: { jid: { type: string }, lat: { type: number }, lon: { type: number }, name: { type: string }, address: { type: string } } } } } }
+
+  /messages/send/contact:
+    post:
+      summary: Send contact vCard
+
+  /messages/send/poll:
+    post:
+      summary: Create poll
+      requestBody: { content: { "application/json": { schema: { type: object, required: [jid, name, values], properties: { jid: { type: string }, name: { type: string }, values: { type: array, items: { type: string }, minItems: 2 }, selectableCount: { type: integer, default: 1 } } } } } }
+
+  /messages/react:
+    post:
+      summary: React to message
+      requestBody: { content: { "application/json": { schema: { type: object, required: [jid, msgId], properties: { jid: { type: string }, msgId: { type: string }, emoji: { type: string } } } } } }
+
+  /messages/reply:
+    post:
+      summary: Reply with quote
+
+  /messages/delete:
+    post:
+      summary: Delete message
+
+  /messages/edit:
+    post:
+      summary: Edit sent message
+
+  /messages/forward:
+    post:
+      summary: Forward message to another chat
+
+  /messages/read:
+    post:
+      summary: Mark messages as read
+
+  /messages/star:
+    post:
+      summary: Star or unstar a message
+
+  /messages/starred:
+    get:
+      summary: List all starred messages
+
+  /messages/history/{jid}:
+    get:
+      summary: Message history (paginated)
+      parameters:
+        - { name: jid, in: path, required: true, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 50 } }
+        - { name: before, in: query, schema: { type: string, description: Message ID for pagination } }
+
+  /messages/media/{msgId}:
+    get:
+      summary: Download media binary
+
+  /messages/search:
+    get:
+      summary: Search messages globally
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string } }
+        - { name: jid, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 20 } }
+
+  /messages/search/chat/{jid}:
+    get:
+      summary: Search within a single chat
+
+  /presence/update:
+    post:
+      summary: Set own presence (composing/paused/available/unavailable)
+
+  /presence/subscribe:
+    post:
+      summary: Subscribe to presence updates for a JID
+
+  /presence/{jid}:
+    get:
+      summary: Get presence for a JID
+
+  /status:
+    get:
+      summary: Recent status/story updates
+
+  /groups/create:
+    post:
+      summary: Create a group
+      requestBody: { content: { "application/json": { schema: { type: object, required: [name, participants], properties: { name: { type: string }, participants: { type: array, items: { type: string } } } } } } }
+
+  /groups/{jid}/metadata:
+    get:
+      summary: Group info (subject, description, participants)
+
+  /groups/{jid}:
+    patch:
+      summary: Update group subject/description
+
+  /groups/{jid}/participants:
+    post:
+      summary: Add/remove/promote/demote participants
+      requestBody: { content: { "application/json": { schema: { type: object, required: [action, participants], properties: { action: { type: string, enum: [add, remove, promote, demote] }, participants: { type: array, items: { type: string } } } } } } }
+
+  /groups/{jid}/leave:
+    post:
+      summary: Leave group
+
+  /groups/{jid}/invite-code:
+    get:
+      summary: Get group invite link
