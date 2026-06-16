@@ -1,16 +1,17 @@
-# Dependencies
-node_modules/
-
-# Private WhatsApp session + data — NEVER commit these
+# Secrets & runtime — NEVER commit
+.env
 auth_info/
 store.json
 store.json.*
 data/
 media/
 
+# Rust build artifacts
+/pqenv/target/
+target/
+
 # Logs and backups
 *.log
-bridge.log
 *.bak
 
 # Emacs
@@ -18,3 +19,6 @@ bridge.log
 *~
 \#*\#
 .\#*
+
+# Editor / OS
+.DS_Store

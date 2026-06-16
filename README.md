@@ -1,224 +1,263 @@
-<p align="center">
-  <img src="assets/logo.png" alt="whatsapp.el" width="260">
-</p>
+<div align="center">
 
-<h1 align="center">whatsapp.el</h1>
+<img src="assets/logo.png" alt="whatsappel" width="200">
 
-<p align="center">
-  <b>A full WhatsApp client for Emacs.</b><br>
-  Chat from your editor — fully local, no cloud, no middlemen.
-</p>
+# whatsapp.el — telega-style Emacs WhatsApp client
 
-<p align="center">
-  <img alt="Emacs 28+" src="https://img.shields.io/badge/Emacs-28%2B-7F5AB6?logo=gnuemacs&logoColor=white">
-  <img alt="Node 18+" src="https://img.shields.io/badge/Node-18%2B-339933?logo=nodedotjs&logoColor=white">
-  <img alt="License GPL-3.0" src="https://img.shields.io/badge/License-GPL--3.0-blue">
-  <img alt="Version 2.7.2" src="https://img.shields.io/badge/version-2.7.2-25D366">
-</p>
+**Guile bridge · wuzapi engine · no Baileys · no JavaScript**
 
----
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-3.0.0-green.svg)](CHANGELOG.md)
+[![Emacs](https://img.shields.io/badge/Emacs-%E2%89%A528-7F5AB6.svg)](https://www.gnu.org/software/emacs/)
 
-`whatsapp.el` turns Emacs into a real WhatsApp client. An Emacs Lisp front-end
-talks to a small local **Node.js bridge** (powered by
-[Baileys](https://github.com/WhiskeySockets/Baileys)) that speaks the WhatsApp
-Web protocol. Everything runs on your machine — your session, your messages,
-your media never touch a third-party server.
+Official: [git.securityops.co/cristiancmoises/whatsappel](https://git.securityops.co/cristiancmoises/whatsappel)
+· Mirror: [Codeberg](https://codeberg.org/berkeley/whatsappel)
+· Mirror: [GitHub](https://github.com/cristiancmoises/whatsappel)
 
-> Telega for Telegram, ement for Matrix… this is the one for WhatsApp.
+</div>
 
-## 📦 Repositories
+A WhatsApp client for Emacs whose UI/UX follows telega.el. The former Node/Baileys
+backend is gone; every line here is **Guile Scheme** and **Emacs Lisp**. The
+WhatsApp multi-device protocol itself is delegated to **wuzapi**
+(Go/[whatsmeow](https://github.com/tulir/whatsmeow)) over its local REST API —
+that protocol (Noise + the Signal double-ratchet + WhatsApp protobufs) has no Guile
+implementation and a hand-rolled one would be a homemade-crypto liability. No
+JavaScript anywhere.
 
-**Official** (development happens here):
-
-- Forgejo (primary): <https://git.securityops.co/cristiancmoises/whatsappel>
-- Codeberg: <https://codeberg.org/berkeley/whatsappel>
-
-**Mirror** (read-only):
-
-- GitHub: <https://github.com/cristiancmoises/whatsappel>
-
-Please open issues and pull requests on the **Forgejo** or **Codeberg** repositories.
-
-## ✨ Features
-
-**Messaging**
-- Click a chat and just **type** — `RET` sends, `C-j` for a newline (telega-style input).
-- Send & receive text, **reply with quote**, **react** with emoji, **edit**, **delete** (for me / everyone), **forward**, **star**, mark read.
-- Real-time delivery & read receipts (✓ / ✓✓), typing indicators, online presence.
-
-**Media**
-- **Inline images**; **looping GIFs** and animated stickers; click-to-play **video** and **voice notes** (via `mpv`).
-- **Record & send voice messages** (`C-c v`), attach any file, send location, polls, and contact cards.
-
-**Chats & contacts**
-- Chat list with avatars, unread badges, pin / mute / archive, and live ordering.
-- **Names that actually resolve** — full support for WhatsApp's new `@lid` addressing: real names, phone numbers, and group subjects (no more walls of meaningless numbers).
-- Global & per-chat search, starred messages, groups (create / manage / invite).
-
-**Under the hood**
-- Persistent session — scan the QR **once**.
-- Message history persists across restarts; on-demand paging for older messages.
-- Fully local; optional bearer-token auth and rate limiting on the bridge.
-- Works on GNU/Linux, macOS, and Windows.
-
-## 🏗️ Architecture
+## Architecture
 
 ```
-   Emacs                         Local bridge (Node)              WhatsApp
-┌────────────┐   REST :3000   ┌────────────────────┐   Baileys   ┌──────────┐
-│ whatsapp.el│◀──────────────▶│     server.js      │◀───────────▶│   Web    │
-│  (client)  │   WS   :3001   │ (@whiskeysockets/   │  protocol   │ servers  │
-└────────────┘◀──────────────▶│      baileys)      │             └──────────┘
-                              └────────────────────┘
+  Emacs (whatsapp.el)                 Guile (whatsappel.scm)             wuzapi (Go/whatsmeow)
+ ┌───────────────────────┐  HTTP+tok ┌──────────────────────────┐  HTTP  ┌─────────────────────┐
+ │ root chat-list buffer │ ────────► │ /chats /chat /send       │ ─────► │ /chat/send/text|...  │ ──► WhatsApp
+ │ per-chat buffers      │ ◄──────── │ /send/{image,video,...}  │ ◄───── │ /chat/download*      │
+ │ inline media          │   :7337   │ /download  /connect /qr  │        │ /session/*           │
+ │                       │           │ /hook/<token>  ◄─────────┼────────┤ webhook (inbound)    │
+ └───────────────────────┘ loopback  └──────────────────────────┘  POST  └─────────────────────┘
 ```
 
-- **`lisp/whatsapp.el`** — the Emacs client (UI, buffers, keybindings).
-- **`server.js`** — the bridge: REST API on `:3000`, WebSocket push on `:3001`, session in `auth_info/`, state in `store.json`.
+The bridge keeps a per-chat message store fed by inbound webhooks, records your
+sent messages, and unifies 1:1 and group keys so each conversation is one chat.
 
-## ⚙️ Requirements
+## Quick start
 
-- **Emacs ≥ 28.1** with the [`websocket`](https://melpa.org/#/websocket) package
-- **Node.js ≥ 18** and **npm**
-- A phone with WhatsApp (to link the device once)
-- Optional: `mpv` (audio/video playback), `sox`/`ffmpeg`/`arecord` (voice recording)
-
-## 🚀 Installation
-
-### 1. Get the code
-
-```sh
-git clone https://git.securityops.co/cristiancmoises/whatsappel.git
-cd whatsappel
+```
+./setup.sh        # checks deps, builds+installs pqenv, makes config, generates a token
+# start wuzapi (below), then put its user token in .env (WUZAPI_TOKEN)
+make run          # loads .env and starts the bridge
 ```
 
-### 2. Start the bridge
+`setup.sh` is idempotent — it never overwrites an existing `.env` or PQ identity.
+It installs `pqenv` to `~/.local/bin` and creates `~/.config/whatsappel/pq`. A
+`Makefile` (`make check|pqenv|install|run|clean`) and a hardened systemd user
+unit (`whatsappel.service`) are included. Then load `whatsapp.el` in Emacs (see
+[Emacs setup](#emacs-setup)).
 
-```sh
-npm install
-node server.js
+## UI/UX (telega-style)
+
+- **Root buffer** (`*WhatsApp*`): the chat list, with unread counts and last
+  message. `RET` opens a chat.
+- **Chat buffer** (`*WhatsApp: <jid>*`): read-only history above an editable
+  input prompt at the bottom. Type and `RET` to send; `C-j` for a newline.
+- **Media model, same as telega**: images and stickers render inline; audio,
+  video and GIFs open in an external player. Inbound images/stickers are
+  downloaded and cached automatically (toggle with `whatsapp-auto-load-images`).
+
+### Keybindings
+
+Root buffer (`whatsapp-root-mode`):
+
+| Key | Action |
+|---|---|
+| `RET` | open chat at point |
+| `n` / `p` | next / previous chat |
+| `g` | refresh chat list |
+| `j` | jump to a chat by number |
+| `q` | bury buffer |
+
+Chat buffer (`whatsapp-chat-mode`):
+
+| Key | Action |
+|---|---|
+| `RET` | send the input |
+| `C-j` | newline in input |
+| `C-c C-a` then `i v a f s g` | attach image / video / audio / file / sticker / gif |
+| `RET` or `o` on a media line | download + open that media |
+| `C-c C-l` | refresh this chat |
+| `C-c C-e` | compose + send a post-quantum encrypted message |
+| `C-c C-q` | bury buffer |
+
+Global prefix (`whatsapp-prefix-map`, suggested `C-c w`): `w` chat list,
+`j` open chat, `c` connect, `s` status, `Q` QR, `k` PQ keygen, `i` PQ import
+contact key, `f` show PQ fingerprint.
+
+## Dependencies
+
+- **Guile 3.0** + **guile-json** — the bridge.
+- **wuzapi** (Go) — the WhatsApp engine: <https://github.com/asternic/wuzapi>.
+- **Emacs ≥ 28** — the client. An external player (`mpv`, `xdg-open`, …) for
+  audio/video/GIF.
+
+### Install Guile + guile-json
+
+```
+sudo apt install guile-3.0 guile-json     # Debian/Ubuntu
+sudo pacman -S guile guile-json           # Arch (guile-json may be AUR)
+sudo dnf install guile guile-json         # Fedora
+guix shell -m manifest.scm                # Guix
 ```
 
-The first time, a QR code is printed. On your phone open
-**WhatsApp → Linked Devices → Link a device** and scan it. The session is saved
-to `auth_info/`, so you only do this once.
+### wuzapi
 
-Prefer a background service? Use the provided unit:
-
-```sh
-make install            # or copy whatsappel.service to ~/.config/systemd/user/
-systemctl --user enable --now whatsappel
+```
+git clone https://github.com/asternic/wuzapi.git && cd wuzapi && go build .
+WUZAPI_ADMIN_TOKEN=$(openssl rand -hex 16) ./wuzapi -address 127.0.0.1 -port 8080
+curl -s -X POST -H "Authorization: $WUZAPI_ADMIN_TOKEN" -H 'Content-Type: application/json' \
+     --data '{"name":"me","token":"YOUR_WUZAPI_USER_TOKEN","events":"Message"}' \
+     http://127.0.0.1:8080/admin/users
 ```
 
-### 3. Load the Emacs client
+> wuzapi's user-auth header is `Token` in its examples but `Authorization` in its
+> API reference (varies by build). The bridge defaults to `Token`; override with
+> `WUZAPI_TOKEN_HEADER=Authorization` if needed.
 
-Put `lisp/whatsapp.el` on your `load-path` and `require` it. The included
-[`init.el`](init.el) is a ready-to-copy example. Minimal version:
+## Run the bridge
+
+```
+cp env.example .env && $EDITOR .env       # set WHATSAPPEL_TOKEN and WUZAPI_TOKEN
+set -a; . ./.env; set +a
+guile whatsappel.scm
+```
+
+`WHATSAPPEL_TOKEN` and `WUZAPI_TOKEN` are required; the bridge refuses to start
+without them. Generate the bridge token with `openssl rand -hex 32`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `WHATSAPPEL_TOKEN` | *(required)* | Emacs↔bridge auth and webhook path secret |
+| `WHATSAPPEL_HOST` | `127.0.0.1` | bind address |
+| `WHATSAPPEL_PORT` | `7337` | bind port |
+| `WHATSAPPEL_PUBLIC_URL` | `http://HOST:PORT` | URL wuzapi calls back for webhooks |
+| `WHATSAPPEL_SUBSCRIBE` | `Message` | wuzapi events to subscribe |
+| `WHATSAPPEL_CHAT_CAP` | `500` | messages retained per chat |
+| `WUZAPI_BASE_URL` | `http://127.0.0.1:8080` | wuzapi base URL |
+| `WUZAPI_TOKEN` | *(required)* | wuzapi per-user token |
+| `WUZAPI_TOKEN_HEADER` | `Token` | header carrying the user token |
+
+## Emacs setup
 
 ```elisp
-(add-to-list 'load-path "/path/to/whatsappel/lisp")
+(add-to-list 'load-path "/path/to/whatsappel")
 (require 'whatsapp)
-(global-set-key (kbd "C-c W") #'whatsapp-connect)
+(require 'whatsapp-org)            ; optional — Org-mode integration
+(setq whatsapp-bridge-url   "http://127.0.0.1:7337"
+      whatsapp-bridge-token "the-same-value-as-WHATSAPPEL_TOKEN")
+(global-set-key (kbd "C-c w") whatsapp-prefix-map)
 ```
 
-### 4. Connect
+`M-x whatsapp-connect` → `M-x whatsapp-qr` (scan via WhatsApp ▸ Linked devices) →
+`M-x whatsapp` (chat list). `M-x whatsapp-toggle-polling` for live updates.
 
-`M-x whatsapp-connect` (or `C-c W`). The chat list opens — **click a chat and
-start typing.**
+## Org-mode integration (optional)
 
-## 💬 Daily use
+`whatsapp-org.el` is a separate, opt-in module — the core client never loads Org.
+`(require 'whatsapp-org)` adds three seams:
 
-1. `C-c W` opens the chat list.
-2. **Click** (or `RET`) a chat to open it.
-3. **Type your message** and press `RET` to send (`C-j` for a newline).
-4. Press `c` in the chat list to start a **new conversation** with any contact or number.
-5. Inside a chat, everything else is under the **`C-c` prefix** — or press `C-c h` for the action menu.
+- **`whatsapp:` links.** `org-store-link` (`C-c l`) in a chat buffer or on a
+  root-list line yields `[[whatsapp:<jid>][WhatsApp: <name>]]`; following the link
+  opens that chat. `C-c C-l` completion offers your known chats.
+- **Capture.** `whatsapp-org-capture` (`C-c C-o` in a chat, or `o` in
+  `whatsapp-prefix-map`) files the message at point through `org-capture` with the
+  sender, an inactive timestamp, a jump-back link, and the text as a quote block.
+  PQ-safe: an undecrypted `WAPQ1:` envelope is captured as its placeholder, never
+  silently revealed.
+- **Send from Org.** `whatsapp-org-mode` adds `C-c C-w s` (send the current
+  subtree), `C-c C-w r` (send the region) and `C-c C-w g` (jump entry → chat). The
+  target resolves from the entry's inherited `WHATSAPP_JID` property or a prompt;
+  every send asks for confirmation first.
 
-## ⌨️ Keybindings
+## Behaviour notes (honest limits)
 
-**Chat list**
+- Outbound media is shown in the conversation as a `[kind] caption` placeholder —
+  the bytes you sent are not stored back, so they are not re-rendered inline.
+- Inbound media rendering is best-effort: the bridge extracts wuzapi's media
+  download fields from the webhook event defensively across key-casing variants,
+  and always preserves the raw event. If a build's event schema differs, the
+  message still appears as a labelled placeholder rather than failing.
+- GIFs are sent through the video endpoint (WhatsApp represents GIFs as looping
+  MP4 videos).
+- The interactive buffer behaviour is not exercised by the build's automated
+  tests (headless, no display); the client byte-compiles clean and its pure
+  helpers are unit-tested, and the bridge is integration-tested end to end.
 
-| Key | Action |
-|-----|--------|
-| `RET` / `mouse-1` | Open chat |
-| `c` | New message |
-| `C` | Contacts browser |
-| `g` | Refresh · `s` filter · `S` search messages |
-| `G` | Create group |
-| `A` / `P` / `M` | Archive / Pin / Mute |
-| `1` `2` `3` `0` | Filter unread / groups / direct / clear |
-| `*` | Starred · `h` actions · `q` bury |
+## Security model
 
-**Inside a chat** — *just type to compose*
+**Protects**
+- The Emacs-facing API requires `X-Whatsappel-Token`; the inbound webhook is
+  reachable only at `/hook/<token>`. Token comparison is constant-time. Bridge
+  and wuzapi both bind to loopback. Transport inherits WhatsApp's own E2EE.
 
-| Key | Action |
-|-----|--------|
-| `RET` | Send |
-| `C-j` / `S-RET` | Newline |
-| `C-c r` / `C-c e` / `C-c E` | Reply / React / Edit |
-| `C-c d` / `C-c f` / `C-c w` | Delete / Forward / Copy text |
-| `C-c a` / `C-c v` | Attach file / Voice note (toggle record) |
-| `C-c m` / `C-c M` | Play media / Download |
-| `C-c l` · `C-c C-p` · `C-c C-v` | Location · Poll · Contact card |
-| `M-p` / `M-n` | Previous / next message |
-| `C-c g` / `C-c <` | Scroll to bottom / Load older |
-| `C-c h` | **Action menu** (everything) |
+**Does NOT protect against**
+- A compromised host: the bridge and wuzapi see plaintext locally.
+- wuzapi's on-disk session is a linked-device credential — anyone who can read it
+  can impersonate your WhatsApp. Restrict its directory; use full-disk encryption.
+- Plaintext secrets in `.env` and Emacs config — protect both files.
+- Metadata (who you message, when, group membership) — visible to Meta.
+- Account bans: wuzapi/whatsmeow is an unofficial client; use may violate
+  WhatsApp's Terms of Service.
 
-`mouse-1` on an image, video, GIF, or voice message plays/opens it. Right-click any message for a context menu. Full list: `M-x whatsapp-help`.
+## Post-quantum messages (opt-in, 1:1)
 
-## 🔧 Configuration
+An optional end-to-end **post-quantum envelope** rides inside a normal WhatsApp
+text message as a `WAPQ1:` blob, built by the bundled [`pqenv`](pqenv/README.md)
+tool (ML-KEM-1024 + ML-DSA-87 + ChaCha20-Poly1305, HKDF-SHA256; primitives from
+the formally verified libcrux). It protects content **only between two whatsappel
+users who have exchanged public keys** — to any normal contact it is an opaque
+blob, and it does not hide metadata from Meta. It is not "post-quantum WhatsApp."
 
-```elisp
-(setq whatsapp-server-host "localhost"
-      whatsapp-server-port 3000
-      whatsapp-ws-port     3001
-      ;; whatsapp-api-token "shared-secret"   ; only if the bridge sets WAEL_API_TOKEN
-      whatsapp-inline-images       t          ; show photos inline (GUI Emacs)
-      whatsapp-animate-gifs        t          ; loop GIFs / animated stickers
-      whatsapp-show-profile-pics   t          ; avatars in the chat list
-      whatsapp-auto-read           t
-      whatsapp-typing-indicator    t
-      whatsapp-audio-player        "mpv"
-      whatsapp-video-player        "mpv"
-      whatsapp-voice-record-command "sox")    ; or "ffmpeg" / "arecord"
-```
+Usage:
 
-The bridge is configured via environment variables: `WAEL_PORT`, `WAEL_WS_PORT`,
-`WAEL_AUTH_DIR`, `WAEL_MEDIA_DIR`, `WAEL_STORE_FILE`, `WAEL_API_TOKEN`,
-`WAEL_RATE_LIMIT`, `WAEL_LOG_LEVEL`. See [`docs/BRIDGE.md`](docs/BRIDGE.md) and
-[`openapi.yaml`](openapi.yaml) for the full REST/WebSocket reference.
+1. `C-c w k` (`whatsapp-pq-keygen`) — once, to create your identity. Share
+   `~/.config/whatsappel/pq/identity.public` with your contact.
+2. `C-c w i` (`whatsapp-pq-import-contact`) — import their `.public` and associate
+   it with the chat. Verify the printed fingerprint out of band. The fingerprint is
+   pinned on first import (TOFU): a later import of a *different* key for the same
+   chat is refused — a silent change can mean key substitution — unless you re-verify
+   and override with `C-u C-c w i`.
+3. In the chat, type and press `C-c C-e` to send encrypted. Inbound `WAPQ1:`
+   messages are verified and decrypted on view, shown with a `[PQ]` marker;
+   messages outside the freshness window show `[encrypted — stale/replayed:
+   outside freshness window]` and other failures show `[encrypted — decrypt/verify
+   FAILED]`. The window is `whatsapp-pq-max-age` (default 7 days; 0 disables it).
 
-## 🔒 Privacy & security
+Limits (carried from the `pqenv` threat model): 1:1 only (group keying is future
+work); the in-chat `C-c C-e` path uses the single-shot envelope, which has **no
+forward secrecy** (long-term KEM identity keys). A forward-secure session layer
+(WAPQR: ephemeral-prekey bootstrap + symmetric ratchet) now exists in `pqenv`
+(`ratchet-prekey`/`-init`/`-accept`/`-send`/`-recv`); wiring stateful per-chat
+sessions into this client is the next step. Replay of *old* captured envelopes is
+blocked by the freshness window on view; per-message replay-on-receive across
+restarts is not wired. See [pqenv/README.md](pqenv/README.md) for the full threat
+model, wire formats, and the WAPQR handshake.
 
-Everything is local. Your linked-device session lives in `auth_info/` and your
-chats in `store.json` — **never commit or share these** (they're already in
-`.gitignore`). The bridge listens only on `localhost`; enable `WAEL_API_TOKEN`
-if you expose it.
+## Repositories
 
-## ✍️ A note from the author
+| Role | URL |
+|---|---|
+| **Official** (Forgejo) | <https://git.securityops.co/cristiancmoises/whatsappel> |
+| Mirror (Codeberg) | <https://codeberg.org/berkeley/whatsappel> |
+| Mirror (GitHub) | <https://github.com/cristiancmoises/whatsappel> |
 
-Here in Brazil, WhatsApp is practically a necessity — so much so that I once
-bought a brand-new smartphone *just* to install it and keep in touch with a few
-friends, family, and work.
+Issues and pull requests are tracked on the Forgejo repo; the mirrors are
+read-only copies kept in sync at each release.
 
-This project grew out of a simple wish: to live inside Emacs for everything, all
-day long. Now you can (almost) put your smartphone down too.
+## Author
 
-Feel free to use this tool. If you like it, please share it with your friends.
-Have a nice day.
+Cristian Cezar Moisés — <https://securityops.co>
 
-Remember… **in code we trust.**
+## License
 
-— *Cristian Cezar Moisés*
-
-## 🤝 Contributing
-
-Issues and pull requests are welcome on the official
-[Forgejo](https://git.securityops.co/cristiancmoises/whatsappel) and
-[Codeberg](https://codeberg.org/berkeley/whatsappel) repos. See
-[`CONTRIBUTING.md`](CONTRIBUTING.md).
-
-## 📜 License
-
-Released under the **GNU General Public License v3.0** — see [`LICENSE`](LICENSE).
-
-<p align="center"><i>Enjoy messaging from the comfort of Emacs ⚡</i></p>
+[`AGPL-3.0-only`](LICENSE). A network-facing bridge is the textbook AGPL case: if
+you run a modified version as a service, the AGPL requires you to offer that
+modified source to its users. The bundled `pqenv` crate and the Guile bridge carry
+the same `SPDX-License-Identifier: AGPL-3.0-only` headers.

@@ -1,28 +1,28 @@
+# systemd user unit for the whatsappel bridge.
+# Install: cp whatsappel.service ~/.config/systemd/user/
+#          systemctl --user daemon-reload && systemctl --user enable --now whatsappel
+# Requires an EnvironmentFile with WHATSAPPEL_TOKEN and WUZAPI_TOKEN.
 [Unit]
-Description=WhatsApp.el Bridge Server (Baileys)
-Documentation=https://git.securityops.co/cristiancmoises/whatsappel
+Description=whatsappel bridge (Emacs <-> wuzapi)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/.local/share/whatsappel
-ExecStart=/usr/bin/node server.js
+WorkingDirectory=%h/whatsappel
+EnvironmentFile=%h/whatsappel/.env
+ExecStart=/usr/bin/guile %h/whatsappel/whatsappel.scm
 Restart=on-failure
-RestartSec=5
-
-Environment=WAEL_PORT=3000
-Environment=WAEL_WS_PORT=3001
-Environment=WAEL_AUTH_DIR=%h/.local/share/whatsappel/auth_info
-Environment=WAEL_MEDIA_DIR=%h/.local/share/whatsappel/media
-Environment=WAEL_STORE_FILE=%h/.local/share/whatsappel/store.json
-Environment=WAEL_LOG_LEVEL=warn
-Environment=NODE_ENV=production
-
-# Security hardening
-NoNewPrivileges=yes
+RestartSec=3
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.local/share/whatsappel
+ReadWritePaths=%h/.config/whatsappel
+ProtectControlGroups=true
+ProtectKernelTunables=true
+RestrictNamespaces=true
 
 [Install]
 WantedBy=default.target

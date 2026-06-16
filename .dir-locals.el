@@ -5,6 +5,8 @@
   (fill-column . 100)
   (sentence-end-double-space . nil)
   (emacs-lisp-docstring-fill-column . 80))
- (js-mode
+ (scheme-mode
+  (indent-tabs-mode . nil))
+ (rust-mode
   (indent-tabs-mode . nil)
-  (js-indent-level . 2)))
+  (fill-column . 100)))

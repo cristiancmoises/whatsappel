@@ -1,6 +1,46 @@
 # Changelog
 
-All notable changes to WhatsApp.el are documented here.
+All notable changes to WhatsApp.el are documented here. This project adheres to
+[Semantic Versioning](https://semver.org/).
+
+## [3.0.0] — 2026-06-16
+
+A ground-up rewrite. The Node/Baileys bridge is **gone**; there is no JavaScript
+anywhere. The backend is now **Guile Scheme** (`whatsappel.scm`) talking to
+**wuzapi** (Go/whatsmeow) over its local REST API, and the client is **Emacs Lisp**.
+
+### Changed (breaking)
+- **New architecture: Emacs ⇄ Guile bridge ⇄ wuzapi.** The bridge is a single
+  Guile program on `127.0.0.1:7337`; the WhatsApp multi-device protocol (Noise +
+  Signal double-ratchet + protobufs) is delegated to wuzapi rather than reimplemented.
+- **Client rewritten** as a lean, telega-style `whatsapp.el` (`whatsapp-bridge-url`
+  / `whatsapp-bridge-token`): root chat-list buffer, per-chat message buffers with
+  a bottom input prompt, inline images/stickers, external player for audio/video/GIF.
+- **Removed** `server.js`, `package.json`, `package-lock.json`, the Node test
+  suite, the Baileys bridge docs, the Docker/compose files and the OpenAPI spec —
+  none apply to the Guile backend.
+- **License** moved to `AGPL-3.0-only` (a network-facing bridge is the textbook
+  AGPL case); all source files carry SPDX headers.
+
+### Added
+- **`pqenv`** — a bundled Rust crate (`#![forbid(unsafe_code)]`) implementing an
+  opt-in, 1:1 **post-quantum message envelope** (`WAPQ1:`): ML-KEM-1024 +
+  ML-DSA-87 + ChaCha20-Poly1305 + HKDF-SHA256, primitives from the formally
+  verified libcrux. In-chat keygen (`C-c w k`), TOFU contact-key import
+  (`C-c w i`), fingerprint display (`C-c w f`) and encrypted send (`C-c C-e`), with
+  a freshness/replay window on view. Includes an experimental forward-secure
+  ratchet (WAPQR) at the CLI/library level.
+- **`whatsapp-org.el`** — optional Org-mode integration (loaded only on request):
+  a `whatsapp:` Org link type, `org-capture` of the message at point (PQ-safe), and
+  send-from-Org (`C-c C-w s/r`, `WHATSAPP_JID` property targeting).
+- **Packaging & ops**: idempotent `setup.sh`, a `Makefile` (`check`/`pqenv`/
+  `install`/`run`), a Guix `manifest.scm`, an `env.example`, and a hardened
+  `whatsappel.service` systemd user unit.
+
+### Security
+- Emacs-facing API and inbound webhook are gated by a constant-time token check;
+  bridge and wuzapi bind to loopback only. Documented threat model for both the
+  bridge and the post-quantum envelope (see README and `pqenv/README.md`).
 
 ## [2.7.2] — 2026-06-13
 

@@ -1,84 +1,40 @@
-.PHONY: all compile lint clean install install-server install-service test help
+# whatsappel — convenience targets
+SHELL := /bin/bash
+CARGO ?= cargo
+BIN   ?= $(HOME)/.local/bin
 
-EMACS ?= emacs
-NODE ?= node
-NPM ?= npm
-PREFIX ?= $(HOME)/.local
+.PHONY: help setup check pqenv install run clean
 
-EL_FILES = whatsapp.el
-ELC_FILES = $(EL_FILES:.el=.elc)
+help:
+	@echo "make setup   - build pqenv, install, create config + token"
+	@echo "make check   - compile bridge, byte-compile client, build pqenv, run tests"
+	@echo "make pqenv   - build pqenv (release)"
+	@echo "make install - install pqenv to $(BIN)"
+	@echo "make run     - load .env and start the Guile bridge"
+	@echo "make clean   - remove build artifacts"
 
-all: compile ## Build everything
+setup:
+	./setup.sh
 
-compile: $(ELC_FILES) ## Byte-compile whatsapp.el
-	@echo "✓ Byte-compilation complete"
+check:
+	guile -c '(use-modules (system base compile)) (compile-file "whatsappel.scm" #:output-file "/tmp/whatsappel.go")'
+	emacs -Q --batch -L . -f batch-byte-compile whatsapp.el
+	$(CARGO) build --release --manifest-path pqenv/Cargo.toml
+	$(CARGO) test --manifest-path pqenv/Cargo.toml
 
-%.elc: %.el
-	$(EMACS) --batch \
-		--eval "(require 'package)" \
-		--eval "(package-initialize)" \
-		-L . \
-		-f batch-byte-compile $<
+pqenv:
+	$(CARGO) build --release --manifest-path pqenv/Cargo.toml
 
-lint: ## Check for common issues
-	$(EMACS) --batch \
-		--eval "(require 'package)" \
-		--eval "(package-initialize)" \
-		-L . \
-		--eval "(require 'checkdoc)" \
-		--eval "(setq sentence-end-double-space nil)" \
-		-f batch-byte-compile $(EL_FILES)
-	@echo "✓ Lint passed"
+install: pqenv
+	install -d $(BIN)
+	install -m 0755 pqenv/target/release/pqenv $(BIN)/pqenv
 
-clean: ## Remove build artifacts
-	rm -f $(ELC_FILES)
-	@echo "✓ Clean"
+run:
+	set -a; . ./.env; set +a; guile whatsappel.scm
 
-install: compile install-server ## Install everything
-	@echo "✓ Full install complete"
+clean:
+	$(CARGO) clean --manifest-path pqenv/Cargo.toml || true
+	rm -f *.elc /tmp/whatsappel.go
 
-install-server: ## Install server dependencies
-	$(NPM) install --production
-	@echo "✓ Server dependencies installed"
-
-install-service: ## Install systemd user service
-	mkdir -p $(HOME)/.config/systemd/user
-	mkdir -p $(HOME)/.local/share/whatsappel
-	cp server.js package.json $(HOME)/.local/share/whatsappel/
-	cd $(HOME)/.local/share/whatsappel && $(NPM) install --production
-	cp whatsappel.service $(HOME)/.config/systemd/user/
-	systemctl --user daemon-reload
-	@echo "✓ Service installed"
-	@echo "  Enable: systemctl --user enable whatsappel"
-	@echo "  Start:  systemctl --user start whatsappel"
-	@echo "  Logs:   journalctl --user -u whatsappel -f"
-
-test: ## Run server syntax check and Elisp byte-compile check
-	$(NODE) -c server.js
-	@echo "✓ server.js syntax OK"
-	$(EMACS) --batch \
-		--eval "(require 'package)" \
-		--eval "(package-initialize)" \
-		-L . \
-		-f batch-byte-compile $(EL_FILES) 2>&1 | grep -v "^Compiling"
-	@echo "✓ whatsapp.el compiles clean"
-
-test-server: ## Run server endpoint tests (requires running server)
-	$(NODE) test/test-server.js
-	@echo "✓ Server tests passed"
-
-docker-build: ## Build Docker image
-	docker build -t whatsappel .
-	@echo "✓ Docker image built"
-
-docker-run: ## Run server in Docker
-	docker compose up -d
-	@echo "✓ Server running (docker compose logs -f to watch)"
-
-docker-stop: ## Stop Docker server
-	docker compose down
-	@echo "✓ Server stopped"
-
-help: ## Show this help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
-		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
+audit:
+	audit/security-audit.sh
