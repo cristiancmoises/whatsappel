@@ -3,7 +3,7 @@
 All notable changes to WhatsApp.el are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [3.0.1] — 2026-06-16
 
 ### Added
 - **History import.** The bridge now pulls existing conversations from wuzapi on
