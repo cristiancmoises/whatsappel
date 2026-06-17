@@ -22,3 +22,6 @@ target/
 
 # Editor / OS
 .DS_Store
+
+# Release artifacts (built, not tracked)
+/dist/

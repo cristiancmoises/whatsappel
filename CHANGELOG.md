@@ -3,6 +3,21 @@
 All notable changes to WhatsApp.el are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Documentation
+- **Autostart guide** in the README covering both systemd (`whatsappel.service`)
+  and Guix System / Guix Home (shepherd), including the bridge→wuzapi dependency,
+  loopback binding, runtime-only secrets and a persistent wuzapi session.
+- Recommended Emacs wiring that reads `whatsapp-bridge-token` (and host/port) from
+  `~/whatsappel/.env` at startup, so the client and bridge tokens can never drift.
+- Documented the end-to-end bring-up (wuzapi build/run → user token → bridge → QR).
+
+### Added
+- `contrib/guix-home-whatsappel.scm` — ready-to-splice Guix Home shepherd services
+  that autostart wuzapi + the Guile bridge at login (the shepherd counterpart of
+  the bundled systemd unit).
+
 ## [3.0.0] — 2026-06-16
 
 A ground-up rewrite. The Node/Baileys bridge is **gone**; there is no JavaScript

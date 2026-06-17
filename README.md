@@ -144,6 +144,37 @@ without them. Generate the bridge token with `openssl rand -hex 32`.
 | `WUZAPI_TOKEN` | *(required)* | wuzapi per-user token |
 | `WUZAPI_TOKEN_HEADER` | `Token` | header carrying the user token |
 
+## Autostart
+
+Run wuzapi and the bridge at login so they're always up (the bridge depends on
+wuzapi, so start it second / declare the dependency).
+
+**systemd (most distros).** A hardened user unit for the bridge ships as
+[`whatsappel.service`](whatsappel.service):
+
+```
+cp whatsappel.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now whatsappel
+```
+
+Run wuzapi under its own unit (wuzapi ships a `wuzapi.service`), or add one that
+`Before=`/`Wants=` the bridge.
+
+**Guix System / Guix Home (shepherd).** Splice the two services in
+[`contrib/guix-home-whatsappel.scm`](contrib/guix-home-whatsappel.scm) into the
+`services` list of your `home-environment`, then:
+
+```
+guix home reconfigure ~/.config/guix/home.scm
+herd start whatsappel-bridge        # pulls in wuzapi via (requirement '(wuzapi))
+herd status                         # both should be running
+```
+
+Both daemons bind to loopback only; secrets are read at runtime from
+`~/wuzapi/.env` and `~/whatsappel/.env` (mode `600`), never placed in the store.
+The wuzapi session persists under `~/.config/whatsappel/wuzapi-data`, so the phone
+link survives restarts — no re-scan.
+
 ## Emacs setup
 
 ```elisp
@@ -157,6 +188,30 @@ without them. Generate the bridge token with `openssl rand -hex 32`.
 
 `M-x whatsapp-connect` → `M-x whatsapp-qr` (scan via WhatsApp ▸ Linked devices) →
 `M-x whatsapp` (chat list). `M-x whatsapp-toggle-polling` for live updates.
+
+The client's `whatsapp-bridge-token` **must equal** the bridge's `WHATSAPPEL_TOKEN`.
+Instead of copying the secret into your config, read it from `.env` at startup so
+the two can never drift — this is the recommended wiring:
+
+```elisp
+(defun my/whatsapp-load-bridge-env ()
+  "Set bridge URL + token from ~/whatsappel/.env (single source of truth)."
+  (let ((env (expand-file-name "~/whatsappel/.env")) (host "127.0.0.1") (port "7337"))
+    (when (file-readable-p env)
+      (with-temp-buffer
+        (insert-file-contents env)
+        (dolist (pair '(("WHATSAPPEL_HOST" . host) ("WHATSAPPEL_PORT" . port)))
+          (goto-char (point-min))
+          (when (re-search-forward
+                 (format "^[ \t]*\\(?:export[ \t]+\\)?%s=\"?\\([^\"\n]+\\)\"?" (car pair)) nil t)
+            (set (cdr pair) (match-string 1))))
+        (goto-char (point-min))
+        (when (re-search-forward
+               "^[ \t]*\\(?:export[ \t]+\\)?WHATSAPPEL_TOKEN=\"?\\([^\"\n]+\\)\"?" nil t)
+          (setq whatsapp-bridge-token (match-string 1)))))
+    (setq whatsapp-bridge-url (format "http://%s:%s" host port))))
+(with-eval-after-load 'whatsapp (my/whatsapp-load-bridge-env))
+```
 
 ## Org-mode integration (optional)
 
