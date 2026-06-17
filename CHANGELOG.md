@@ -3,6 +3,23 @@
 All notable changes to WhatsApp.el are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [3.0.3] — 2026-06-17
+
+### Added
+- **Native quoted reply.** Replying to a message now threads it server-side via
+  WhatsApp's `ContextInfo` (`StanzaID` + `Participant`), not just a local quote.
+  `C-c C-r` sets the reply target (shown above the input; `C-c C-k` cancels), the
+  next send carries the context, and inbound replies render their quoted text
+  inline. Bridge `/send` accepts `reply_id`/`reply_participant`/`reply_text`.
+- **Media retry for expired media.** `R` on a media line (or the action menu) asks
+  the sender to re-upload media whose CDN URL has expired, via a new bridge
+  `POST /mediaretry` and an optional wuzapi patch
+  ([`contrib/wuzapi/`](contrib/wuzapi/)) that triggers whatsmeow's
+  `SendMediaRetryReceipt` and, on the async response, decrypts it and refreshes the
+  stored `directPath`. Best-effort (sender must be online and still have the media).
+- **Targeted re-sync.** `POST /sync {"jid": ...}` re-imports a single chat (used
+  after a media retry); `C-c w S` / `M-x whatsapp-sync` triggers it.
+
 ## [3.0.2] — 2026-06-16
 
 ### Fixed

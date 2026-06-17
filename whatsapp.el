@@ -91,6 +91,8 @@ old captured envelopes; tolerates clock skew and delayed delivery."
 (defvar-local whatsapp-chat--jid nil "JID/number of the chat in this buffer.")
 (defvar-local whatsapp-chat--target nil "wuzapi Phone target for this chat.")
 (defvar-local whatsapp-chat--input-marker nil "Marker at the start of the input area.")
+(defvar-local whatsapp-chat--reply nil
+  "Pending reply target: plist (:id :participant :text :who), or nil.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; HTTP + small helpers
@@ -221,9 +223,10 @@ Return (STATUS . DATA): STATUS the HTTP code or nil, DATA parsed JSON or nil."
     (define-key m (kbd "o")   #'whatsapp-chat-open-media-at-point)
     (define-key m [mouse-1]   #'whatsapp-chat-open-media-at-point)
     (define-key m (kbd "s")   #'whatsapp-chat-save-media)
+    (define-key m (kbd "R")   #'whatsapp-chat-retry-media)
     (define-key m (kbd "m")   #'whatsapp-chat-message-menu)
     m)
-  "Keymap placed on media regions: RET/o/click open, s save, m action menu.")
+  "Keymap on media regions: RET/o/click open, s save, R retry expired, m menu.")
 
 (defun whatsapp--tag-media (beg end media kind id)
   "Tag region BEG..END with MEDIA, KIND, ID and the media keymap."
@@ -289,11 +292,20 @@ at point rather than re-parsing the rendered line."
          (cap   (cdr (assoc "caption" m)))
          (id    (cdr (assoc "id" m)))
          (media (cdr (assoc "media" m)))
+         (reply (cdr (assoc "reply" m)))
          (tss   (whatsapp--fmt-ts ts))
          (hdr   (concat (if (> (length tss) 0) (format "[%s] " tss) "")
                         (propertize (concat name ": ")
                                     'face (if me 'font-lock-keyword-face 'bold)))))
     (insert hdr)
+    (when (and (stringp reply) (> (length reply) 0))
+      (insert (propertize
+               (format "↳ %s\n%s"
+                       (truncate-string-to-width
+                        (replace-regexp-in-string "\n" " " reply) 70)
+                       (make-string (length (if (> (length tss) 0)
+                                                (format "[%s] " tss) "")) ?\s))
+               'face 'font-lock-comment-face)))
     (cond
      ((and (stringp text) (whatsapp--pq-text-p text))
       (whatsapp--insert-pq me text id))
@@ -380,6 +392,37 @@ at point rather than re-parsing the rendered line."
                                (when (stringp id) (list (cons "id" id)))))
     (message "whatsapp: marked read")))
 
+(defun whatsapp-sync (&optional jid)
+  "Re-import chats/history from wuzapi.  With JID, only re-import that chat."
+  (interactive)
+  (whatsapp--request "POST" "/sync" (when jid (list (cons "jid" jid))))
+  (when (derived-mode-p 'whatsapp-chat-mode) (whatsapp-chat-refresh))
+  (message "whatsapp: synced%s" (if jid (format " (%s)" jid) "")))
+
+(defun whatsapp-chat-retry-media ()
+  "Ask the sender to re-upload the (expired) media of the message at point.
+Best-effort: the sender must be online and still have the media.  A few seconds
+later this chat is re-synced so you can open the media again (RET)."
+  (interactive)
+  (let* ((m   (whatsapp--message-at-point))
+         (id  (whatsapp--msg-field m "id"))
+         (jid whatsapp-chat--jid)
+         (buf (current-buffer)))
+    (unless (and (stringp id) (whatsapp--msg-field m "media"))
+      (user-error "No media to retry on this message"))
+    (let ((res (whatsapp--request "POST" "/mediaretry" (list (cons "id" id)))))
+      (unless (whatsapp--ok-p (car res))
+        (user-error "whatsapp: media retry request failed: %S" (cdr res)))
+      (when id (remhash id whatsapp--media-cache))
+      (message "whatsapp: re-upload requested — re-syncing this chat in ~8s…")
+      (run-at-time
+       8 nil
+       (lambda ()
+         (when (buffer-live-p buf)
+           (with-current-buffer buf
+             (ignore-errors (whatsapp-sync jid))
+             (message "whatsapp: re-synced — open the media again with RET"))))))))
+
 (defun whatsapp-chat-save-media ()
   "Download the media of the message at point and save it to a file."
   (interactive)
@@ -456,20 +499,34 @@ Return non-nil on success."
      (t (user-error "Nothing to forward")))))
 
 (defun whatsapp-chat-reply ()
-  "Insert a quoted reference to the message at point into the input area.
-This is a textual quote (WhatsApp's native quoted-reply context is not wired);
-type your reply after it and press RET."
+  "Set the message at point as the reply target for the next send.
+Sends a native WhatsApp quoted reply when the author's JID is known (an inbound
+message); otherwise the quote is shown locally but not threaded server-side."
   (interactive)
-  (let* ((m   (whatsapp--message-at-point))
-         (who (or (whatsapp--msg-field m "name") (whatsapp--msg-field m "from") "?"))
-         (txt (or (whatsapp--msg-field m "text") (whatsapp--msg-field m "caption")
-                  (format "[%s]" (or (whatsapp--msg-field m "kind") "msg")))))
-    (when (and whatsapp-chat--input-marker
-               (marker-position whatsapp-chat--input-marker))
-      (goto-char (point-max))
-      (insert (format "> %s: %s\n" who
-                      (truncate-string-to-width (replace-regexp-in-string "\n" " " txt) 80)))
-      (message "whatsapp: quote inserted — type your reply, then RET"))))
+  (let* ((m    (whatsapp--message-at-point))
+         (id   (whatsapp--msg-field m "id"))
+         (me   (whatsapp--msg-field m "me"))
+         (from (whatsapp--msg-field m "from"))
+         (who  (or (whatsapp--msg-field m "name") from "?"))
+         (txt  (or (whatsapp--msg-field m "text") (whatsapp--msg-field m "caption")
+                   (format "[%s]" (or (whatsapp--msg-field m "kind") "msg"))))
+         (part (and (not me) (stringp from) (string-match-p "@" from) from)))
+    (unless (stringp id) (user-error "This message has no id to reply to"))
+    (setq whatsapp-chat--reply
+          (list :id id :participant part
+                :text (replace-regexp-in-string "\n" " " txt) :who who))
+    (whatsapp-chat-refresh)
+    (goto-char (point-max))
+    (message "whatsapp: replying to %s%s — type, then RET (C-c C-k cancels)"
+             who (if part "" "  [local quote — author JID unknown]"))))
+
+(defun whatsapp-chat-cancel-reply ()
+  "Clear the pending reply target."
+  (interactive)
+  (setq whatsapp-chat--reply nil)
+  (whatsapp-chat-refresh)
+  (goto-char (point-max))
+  (message "whatsapp: reply cancelled"))
 
 (defun whatsapp-chat-message-menu ()
   "Telega-style action menu for the message at point."
@@ -477,14 +534,16 @@ type your reply after it and press RET."
   (whatsapp--message-at-point)            ; validate point is on a message
   (pcase (car (read-multiple-choice
                "Message action"
-               '((?r "react") (?R "reply") (?f "forward") (?c "copy")
-                 (?s "save") (?o "open media") (?d "delete") (?m "mark read"))))
+               '((?r "react") (?y "reply") (?f "forward") (?c "copy")
+                 (?s "save") (?o "open media") (?t "retry media")
+                 (?d "delete") (?m "mark read"))))
     (?r (whatsapp-chat-react))
-    (?R (whatsapp-chat-reply))
+    (?y (whatsapp-chat-reply))
     (?f (whatsapp-chat-forward))
     (?c (whatsapp-chat-copy-text))
     (?s (whatsapp-chat-save-media))
     (?o (whatsapp-chat-open-media-at-point))
+    (?t (whatsapp-chat-retry-media))
     (?d (whatsapp-chat-delete-message))
     (?m (whatsapp-chat-mark-read))))
 
@@ -518,6 +577,14 @@ type your reply after it and press RET."
     (let ((hbeg (point)))
       (dolist (m messages) (whatsapp--insert-message m))
       (add-text-properties hbeg (point) '(read-only t front-sticky t)))
+    (when whatsapp-chat--reply
+      (insert (propertize
+               (format "↳ %s %s: %s   (C-c C-k cancel)\n"
+                       (if (plist-get whatsapp-chat--reply :participant) "Reply to" "Quote")
+                       (plist-get whatsapp-chat--reply :who)
+                       (truncate-string-to-width
+                        (or (plist-get whatsapp-chat--reply :text) "") 60))
+               'read-only t 'face 'font-lock-comment-face)))
     (insert (propertize whatsapp-chat-prompt
                         'read-only t 'rear-nonsticky t 'face 'minibuffer-prompt))
     (setq whatsapp-chat--input-marker (point-marker))
@@ -541,14 +608,19 @@ type your reply after it and press RET."
 (defun whatsapp-chat-send-input ()
   "Send the text in the input area to this chat."
   (interactive)
-  (let ((input (string-trim (whatsapp-chat--current-input))))
+  (let* ((input (string-trim (whatsapp-chat--current-input)))
+         (r     whatsapp-chat--reply)
+         (payload (append (list (cons "to" whatsapp-chat--target) (cons "body" input))
+                          (when (and r (plist-get r :participant))
+                            (list (cons "reply_id" (plist-get r :id))
+                                  (cons "reply_participant" (plist-get r :participant))
+                                  (cons "reply_text" (or (plist-get r :text) "")))))))
     (if (= (length input) 0)
         (message "whatsapp: nothing to send")
-      (let ((res (whatsapp--request
-                  "POST" "/send"
-                  (list (cons "to" whatsapp-chat--target) (cons "body" input)))))
+      (let ((res (whatsapp--request "POST" "/send" payload)))
         (if (whatsapp--ok-p (car res))
             (progn
+              (setq whatsapp-chat--reply nil)
               (let ((inhibit-read-only t))
                 (when (marker-position whatsapp-chat--input-marker)
                   (delete-region whatsapp-chat--input-marker (point-max))))
@@ -627,6 +699,7 @@ type your reply after it and press RET."
     (define-key map (kbd "C-c C-m") #'whatsapp-chat-message-menu)
     (define-key map (kbd "C-c r")   #'whatsapp-chat-react)
     (define-key map (kbd "C-c C-r") #'whatsapp-chat-reply)
+    (define-key map (kbd "C-c C-k") #'whatsapp-chat-cancel-reply)
     (define-key map (kbd "C-c C-f") #'whatsapp-chat-forward)
     (define-key map (kbd "C-c C-w") #'whatsapp-chat-copy-text)
     (define-key map (kbd "C-c C-s") #'whatsapp-chat-save-media)
@@ -790,6 +863,7 @@ input area; media commands live on the per-line `whatsapp-media-keymap'.")
     (define-key map (kbd "j") #'whatsapp-open-chat)
     (define-key map (kbd "c") #'whatsapp-connect)
     (define-key map (kbd "s") #'whatsapp-status)
+    (define-key map (kbd "S") #'whatsapp-sync)
     (define-key map (kbd "Q") #'whatsapp-qr)
     (define-key map (kbd "k") #'whatsapp-pq-keygen)
     (define-key map (kbd "i") #'whatsapp-pq-import-contact)

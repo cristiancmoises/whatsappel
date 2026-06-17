@@ -235,6 +235,23 @@
          (cons "FileLength"    (jget mm "fileLength" "FileLength"))
          (cons "FileEncSHA256" (jget mm "fileEncSha256" "FileEncSHA256" "fileEncSHA256")))))
 
+;; Quoted text of a reply, from a message's contextInfo.quotedMessage.
+(define (msg-quoted-text msg)
+  (let* ((etm (and (pair? msg) (or (assoc-ref msg "extendedTextMessage")
+                                   (assoc-ref msg "ExtendedTextMessage"))))
+         (ci  (or (and (pair? etm) (jget etm "contextInfo" "ContextInfo"))
+                  (and (pair? msg) (jget msg "contextInfo" "ContextInfo"))))
+         (qm  (and (pair? ci) (jget ci "quotedMessage" "QuotedMessage"))))
+    (and (pair? qm)
+         (or (jget qm "conversation" "Conversation")
+             (let ((q2 (jget qm "extendedTextMessage" "ExtendedTextMessage")))
+               (and (pair? q2) (jget q2 "text" "Text")))
+             (cond ((assoc-ref qm "imageMessage")   "[image]")
+                   ((assoc-ref qm "videoMessage")   "[video]")
+                   ((assoc-ref qm "stickerMessage") "[sticker]")
+                   ((assoc-ref qm "audioMessage")   "[audio]")
+                   (else #f))))))
+
 ;; Parse a webhook payload (JSON or form jsonData) into a message record.
 ;; Always preserves the raw body.
 (define (extract-message raw)
@@ -269,6 +286,7 @@
                      (cons "text" text)
                      (cons "kind" (or kind (and (pq-text? text) "pq")))
                      (cons "caption" cap)
+                     (cons "reply" (msg-quoted-text msg))
                      (cons "media" (and mm (media-dl-fields mm)))
                      (cons "raw"  raw)))))))))
 
@@ -293,6 +311,7 @@
 ;; phone number) on chats addressed by WhatsApp's anonymous @lid id. Empty = off.
 (define *lidmap-db* (env "WHATSAPPEL_LIDMAP_DB" ""))
 (define *lidmap*    (make-hash-table))   ; lid-number -> phone-number
+(define *rawjid*    (make-hash-table))   ; normalized chat key -> raw wuzapi jid
 
 (define (->list v)
   (cond ((vector? v) (vector->list v)) ((list? v) v) (else '())))
@@ -393,6 +412,7 @@
                (cons "caption" (or mcap
                                    (and (string? mtype) (not (string=? mtype "text"))
                                         (not (string-prefix? ":" (or text ""))) text)))
+               (cons "reply" (msg-quoted-text msg))
                (cons "media" (and mm (media-dl-fields mm)))))))))
 
 (define (import-chat! jid)
@@ -410,6 +430,7 @@
         (when (pair? sorted)
           (with-mutex *smutex*
             (let ((key (normalize-jid jid)))
+              (hash-set! *rawjid* key jid)
               (hash-set! *chats* key (take-last sorted *chat-cap*))
               (unless (hash-ref *unread* key #f) (hash-set! *unread* key 0))
               ;; If contacts/groups didn't name this chat, fall back to the
@@ -492,19 +513,32 @@
 (define (handle-send body-str)
   (let* ((o    (safe-json-parse body-str))
          (to   (and (pair? o) (assoc-ref o "to")))
-         (text (and (pair? o) (assoc-ref o "body"))))
+         (text (and (pair? o) (assoc-ref o "body")))
+         ;; Native quoted reply: when reply_id + reply_participant are present,
+         ;; build wuzapi's ContextInfo so WhatsApp threads the reply.
+         (rid   (and (pair? o) (assoc-ref o "reply_id")))
+         (rpart (and (pair? o) (assoc-ref o "reply_participant")))
+         (rtext (and (pair? o) (assoc-ref o "reply_text")))
+         (ctx   (and (string? rid) (string? rpart)
+                     (> (string-length rid) 0) (> (string-length rpart) 0)
+                     (list (cons "StanzaID" rid) (cons "Participant" rpart)))))
     (if (or (not (string? to)) (not (string? text))
             (= 0 (string-length to)) (= 0 (string-length text)))
         (json-response 400 '(("error" . "missing 'to' or 'body'")))
         (call-with-values
             (lambda () (wuzapi-request 'POST "/chat/send/text"
-                                       (list (cons "Phone" to) (cons "Body" text))))
+                                       (append (list (cons "Phone" to) (cons "Body" text))
+                                               (if ctx
+                                                   (list (cons "ContextInfo" ctx)
+                                                         (cons "QuotedText" (or rtext "")))
+                                                   '()))))
           (lambda (status parsed raw)
             (when (and (>= status 200) (< status 300))
               (store-outbound! to (filter-false
                                    (list (cons "from" "me") (cons "me" #t)
                                          (cons "text" text)
                                          (cons "kind" (and (pq-text? text) "pq"))
+                                         (cons "reply" (and ctx (or rtext "")))
                                          (cons "ts" (current-ts))))))
             (respond-send status parsed raw))))))
 
@@ -604,6 +638,16 @@
                (list (cons "Id" (if (string? id) (vector id) #()))
                      (cons "ChatPhone" to))))))
 
+;; Ask the sender to re-upload expired media (best-effort, async). wuzapi's
+;; whatsappel patch decrypts the response and refreshes the stored directPath;
+;; a later /sync picks it up so the download then succeeds.
+(define (handle-mediaretry body-str)
+  (let* ((o  (safe-json-parse body-str))
+         (id (and (pair? o) (assoc-ref o "id"))))
+    (if (not (string? id))
+        (json-response 400 '(("error" . "missing 'id'")))
+        (relay 'POST "/chat/mediaretry" (list (cons "Id" id))))))
+
 (define (handle-webhook body-str)
   (store-inbound! (extract-message body-str))
   (json-response 200 '(("success" . #t))))
@@ -676,8 +720,14 @@
      ((and (eq? method 'POST) (string=? path "/react"))    (handle-react body*))
      ((and (eq? method 'POST) (string=? path "/delete"))   (handle-delete body*))
      ((and (eq? method 'POST) (string=? path "/markread")) (handle-markread body*))
+     ((and (eq? method 'POST) (string=? path "/mediaretry")) (handle-mediaretry body*))
      ((and (eq? method 'POST) (string=? path "/sync"))
-      (json-response 200 (list (cons "imported" (sync-history!)))))
+      (let* ((o   (and (> (string-length body*) 0) (safe-json-parse body*)))
+             (jid (and (pair? o) (assoc-ref o "jid"))))
+        (if (string? jid)
+            (begin (import-chat! (hash-ref *rawjid* jid jid))
+                   (json-response 200 '(("imported" . 1))))
+            (json-response 200 (list (cons "imported" (sync-history!)))))))
      (else (json-response 404 '(("error" . "not found")))))))
 
 ;;; ---------------------------------------------------------------------------

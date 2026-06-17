@@ -68,12 +68,15 @@ unit (`whatsappel.service`) are included. Then load `whatsapp.el` in Emacs (see
   (image/sticker/video/gif/audio/document), with the correct download endpoint and
   `DirectPath` per kind.
 - **Telega-style actions** on the message at point (`C-c C-m` menu, or direct
-  keys): react with an emoji, quote-reply, forward to another chat, copy text,
-  save media, delete (for everyone), mark read.
+  keys): react with an emoji, **native quoted reply** (threaded server-side via
+  WhatsApp's `ContextInfo`), forward to another chat, copy text, save media,
+  delete (for everyone), mark read. Inbound replies show the quoted text inline.
 - **Expired media** (older than WhatsApp's CDN retention — common for history that
-  predates the link) cannot be re-downloaded; it shows an honest
-  `[kind · indisponível — mídia expirada]` label with `RET` to retry. Media
-  received *after* linking downloads and renders normally.
+  predates the link) cannot be re-downloaded directly. The **media-retry** action
+  (`R` on the media line) asks the sender to re-upload it; this needs the wuzapi
+  patch in [`contrib/wuzapi/`](contrib/wuzapi/) and is best-effort (the sender must
+  be online and still have the media). Media received *after* linking downloads
+  and renders normally.
 
 ### Keybindings
 
@@ -96,9 +99,11 @@ Chat buffer (`whatsapp-chat-mode`):
 | `C-c C-a` then `i v a f s g` | attach image / video / audio / file / sticker / gif |
 | `RET` or `o` on a media line | download + open that media |
 | `s` on a media line | save that media to a file |
-| `C-c C-m` (or `m` on media) | message action menu (react / reply / forward / copy / save / open / delete / mark read) |
+| `R` on a media line | retry (re-request) expired media |
+| `C-c C-m` (or `m` on media) | message action menu (react / reply / forward / copy / save / open / retry / delete / mark read) |
 | `C-c r` | react to the message at point (emoji) |
-| `C-c C-r` | quote-reply to the message at point |
+| `C-c C-r` | reply to the message at point (native quoted reply) |
+| `C-c C-k` | cancel the pending reply |
 | `C-c C-f` | forward the message at point to another chat |
 | `C-c C-w` | copy the message text |
 | `C-c C-s` | save the message's media |
@@ -108,7 +113,8 @@ Chat buffer (`whatsapp-chat-mode`):
 | `C-c C-q` | bury buffer |
 
 Global prefix (`whatsapp-prefix-map`, suggested `C-c w`): `w` chat list,
-`j` open chat, `c` connect, `s` status, `Q` QR, `k` PQ keygen, `i` PQ import
+`j` open chat, `c` connect, `s` status, `S` re-sync from wuzapi, `Q` QR,
+`k` PQ keygen, `i` PQ import
 contact key, `f` show PQ fingerprint.
 
 ## Dependencies
