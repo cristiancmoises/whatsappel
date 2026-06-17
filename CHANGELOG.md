@@ -5,6 +5,18 @@ All notable changes to WhatsApp.el are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+- **History import.** The bridge now pulls existing conversations from wuzapi on
+  startup (and on demand via `POST /sync`) instead of only showing messages that
+  arrive live: it reads `GET /chat/history?chat_jid=index` for the chat list and
+  per-chat history, and resolves display names from `/user/contacts` and
+  `/group/list`. So after linking a device, the chat list and past messages appear
+  immediately. Requires wuzapi history retention enabled for the user
+  (`POST /session/history {"history": N}`); tune the per-chat depth with
+  `WHATSAPPEL_HISTORY` (default 200). Note: chats addressed by WhatsApp's `@lid`
+  (anonymous linked-ID) show their id until a live message supplies a `PushName`,
+  since wuzapi's history rows and contact map don't carry the LID↔phone link.
+
 ### Documentation
 - **Autostart guide** in the README covering both systemd (`whatsappel.service`)
   and Guix System / Guix Home (shepherd), including the bridge→wuzapi dependency,

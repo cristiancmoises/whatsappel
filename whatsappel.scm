@@ -270,6 +270,143 @@
                      (cons "raw"  raw)))))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; History import from wuzapi (existing chats on first link / restart)
+;;;
+;;; wuzapi persists the WhatsApp history-sync into its own DB and exposes it at
+;;; GET /chat/history (requires the user's history retention > 0):
+;;;   ?chat_jid=index      -> { userid: [ {chat_jid,last_updated}, ... ] }
+;;;   ?chat_jid=<jid>      -> [ {chat_jid,sender_jid,message_id,message_type,
+;;;                              text_content,timestamp,data_json}, ... ]
+;;; We pull that once at startup (and on demand via POST /sync) so the chat list
+;;; and per-chat history appear without waiting for a new live message. Names are
+;;; resolved from /user/contacts and /group/list.
+;;; ---------------------------------------------------------------------------
+
+(define *history-limit* (string->number (env "WHATSAPPEL_HISTORY" "200")))
+(define *syncing?* #f)
+
+(define (->list v)
+  (cond ((vector? v) (vector->list v)) ((list? v) v) (else '())))
+
+;; Percent-encode a chat jid for use in a query string ("@" -> "%40", etc.).
+(define (uri-encode s)
+  (string-concatenate
+   (map (lambda (c)
+          (if (or (char-alphabetic? c) (char-numeric? c) (memv c '(#\- #\_ #\.)))
+              (string c)
+              (format #f "%~2,'0X" (char->integer c))))
+        (string->list s))))
+
+;; Resolve display names from contacts (1:1) and group subjects.
+(define (load-names!)
+  (call-with-values (lambda () (wuzapi-request 'GET "/user/contacts" #f))
+    (lambda (st parsed raw)
+      (let ((data (and (pair? parsed) (assoc-ref parsed "data"))))
+        (when (pair? data)
+          (for-each
+           (lambda (pair)
+             (let* ((jid  (car pair)) (info (cdr pair))
+                    (nm   (and (pair? info)
+                               (or (let ((x (assoc-ref info "FullName")))    (and (string? x) (> (string-length x) 0) x))
+                                   (let ((x (assoc-ref info "PushName")))    (and (string? x) (> (string-length x) 0) x))
+                                   (let ((x (assoc-ref info "FirstName")))   (and (string? x) (> (string-length x) 0) x))
+                                   (let ((x (assoc-ref info "BusinessName"))) (and (string? x) (> (string-length x) 0) x))))))
+               (when (and (string? jid) nm)
+                 (hash-set! *names* (normalize-jid jid) nm))))
+           data)))))
+  (call-with-values (lambda () (wuzapi-request 'GET "/group/list" #f))
+    (lambda (st parsed raw)
+      (let* ((data   (and (pair? parsed) (assoc-ref parsed "data")))
+             (groups (and (pair? data) (assoc-ref data "Groups"))))
+        (for-each
+         (lambda (g)
+           (let ((jid (and (pair? g) (assoc-ref g "JID")))
+                 (nm  (and (pair? g) (assoc-ref g "Name"))))
+             (when (and (string? jid) (string? nm) (> (string-length nm) 0))
+               (hash-set! *names* (normalize-jid jid) nm))))
+         (->list groups))))))
+
+;; Build a store record from one history row.
+(define (history-row->rec row)
+  (let* ((dj     (assoc-ref row "data_json"))
+         (info   (and (string? dj)
+                      (let ((p (safe-json-parse dj))) (and (pair? p) (assoc-ref p "Info")))))
+         (fromme (and (pair? info) (eq? #t (assoc-ref info "IsFromMe"))))
+         (name   (and (pair? info) (assoc-ref info "PushName")))
+         (mtype  (assoc-ref row "message_type"))
+         (text   (assoc-ref row "text_content"))
+         (ts     (or (and (pair? info) (assoc-ref info "Timestamp"))
+                     (assoc-ref row "timestamp"))))
+    (filter-false
+     (list (cons "from" (if fromme "me" (assoc-ref row "sender_jid")))
+           (cons "me"   (and fromme #t))
+           (cons "chat" (assoc-ref row "chat_jid"))
+           (cons "name" (and (string? name) (> (string-length name) 0) name))
+           (cons "id"   (assoc-ref row "message_id"))
+           (cons "ts"   ts)
+           (cons "text" text)
+           (cons "kind" (cond ((pq-text? text) "pq")
+                              ((and (string? mtype) (not (string=? mtype "text"))) mtype)
+                              (else #f)))
+           (cons "caption" (and (string? mtype) (not (string=? mtype "text")) text))))))
+
+(define (import-chat! jid)
+  (call-with-values
+      (lambda ()
+        (wuzapi-request 'GET (string-append "/chat/history?chat_jid=" (uri-encode jid)
+                                            "&limit=" (number->string *history-limit*)) #f))
+    (lambda (st parsed raw)
+      (let* ((rows (->list (and (pair? parsed) (assoc-ref parsed "data"))))
+             (recs (map history-row->rec rows))
+             (good (filter (lambda (r) (assoc-ref r "ts")) recs))
+             (sorted (sort good (lambda (a b)
+                                  (string<? (or (assoc-ref a "ts") "")
+                                            (or (assoc-ref b "ts") ""))))))
+        (when (pair? sorted)
+          (with-mutex *smutex*
+            (let ((key (normalize-jid jid)))
+              (hash-set! *chats* key (take-last sorted *chat-cap*))
+              (unless (hash-ref *unread* key #f) (hash-set! *unread* key 0))
+              ;; If contacts/groups didn't name this chat, fall back to the
+              ;; PushName carried by its most recent inbound (non-me) message.
+              (unless (hash-ref *names* key #f)
+                (let loop ((ms (reverse sorted)))
+                  (when (pair? ms)
+                    (let ((nm (assoc-ref (car ms) "name")))
+                      (if (and (not (assoc-ref (car ms) "me")) (string? nm) (> (string-length nm) 0))
+                          (hash-set! *names* key nm)
+                          (loop (cdr ms))))))))))))))
+
+;; Pull every chat's history from wuzapi into the store. Safe to call repeatedly.
+(define (sync-history!)
+  (if *syncing?*
+      0
+      (begin
+        (set! *syncing?* #t)
+        (let ((n 0))
+          (catch #t
+            (lambda ()
+              (load-names!)
+              (call-with-values
+                  (lambda () (wuzapi-request 'GET "/chat/history?chat_jid=index" #f))
+                (lambda (st parsed raw)
+                  (let ((data (and (pair? parsed) (assoc-ref parsed "data"))))
+                    (when (pair? data)
+                      (for-each
+                       (lambda (uentry)
+                         (for-each
+                          (lambda (centry)
+                            (let ((jid (and (pair? centry) (assoc-ref centry "chat_jid"))))
+                              (when (string? jid) (import-chat! jid) (set! n (1+ n)))))
+                          (->list (cdr uentry))))
+                       data))))))
+            (lambda (key . args)
+              (format #t "whatsappel: history sync error: ~a ~a~%" key args)))
+          (set! *syncing?* #f)
+          (format #t "whatsappel: history sync imported ~a chat(s)~%" n)
+          n))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Route handlers
 ;;; ---------------------------------------------------------------------------
 
@@ -444,6 +581,8 @@
      ((and (eq? method 'POST) (string=? path "/download"))      (handle-download body*))
      ((and (eq? method 'GET)  (string=? path "/chats"))         (handle-chats))
      ((and (eq? method 'GET)  (string=? path "/chat"))          (handle-chat-messages query))
+     ((and (eq? method 'POST) (string=? path "/sync"))
+      (json-response 200 (list (cons "imported" (sync-history!)))))
      (else (json-response 404 '(("error" . "not found")))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -454,6 +593,13 @@
   (format #t "whatsappel: bridge on http://~a:~a -> wuzapi ~a~%"
           *host* *port* *wuzapi-base*)
   (format #t "whatsappel: inbound webhook ~a~%" *hook-url*)
+  ;; Import existing chats/history from wuzapi in the background (non-fatal),
+  ;; so the chat list is populated on startup without waiting for live traffic.
+  (call-with-new-thread
+   (lambda ()
+     (sleep 3)
+     (catch #t (lambda () (sync-history!))
+       (lambda (k . a) (format #t "whatsappel: initial sync failed: ~a~%" k)))))
   (run-server handler 'http (list #:host *host* #:port *port*)))
 
 (main)
