@@ -17,6 +17,13 @@ All notable changes to WhatsApp.el are documented here. This project adheres to
   (anonymous linked-ID) show their id until a live message supplies a `PushName`,
   since wuzapi's history rows and contact map don't carry the LID↔phone link.
 
+- **`@lid` name resolution.** Chats addressed by WhatsApp's anonymous linked-ID
+  (`@lid`) carry no phone number in history. Setting `WHATSAPPEL_LIDMAP_DB` to
+  wuzapi's `main.db` lets the bridge read its `whatsmeow_lid_map` (read-only, via
+  `sqlite3`) to map `@lid` to a phone number, then resolve a saved contact name —
+  or fall back to showing the real phone number. On a real account this lifted
+  chat-name coverage from roughly 19% to 98%.
+
 ### Documentation
 - **Autostart guide** in the README covering both systemd (`whatsappel.service`)
   and Guix System / Guix Home (shepherd), including the bridge→wuzapi dependency,

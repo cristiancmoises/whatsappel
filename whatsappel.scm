@@ -32,6 +32,8 @@
              (json)
              (ice-9 format)
              (ice-9 threads)
+             (ice-9 popen)
+             (ice-9 rdelim)
              (rnrs bytevectors)
              (srfi srfi-1)
              (srfi srfi-13))
@@ -285,8 +287,38 @@
 (define *history-limit* (string->number (env "WHATSAPPEL_HISTORY" "200")))
 (define *syncing?* #f)
 
+;; Optional: wuzapi's whatsmeow store (main.db). When set, we read its
+;; `whatsmeow_lid_map' (lid -> phone) read-only to put a name (or at least a real
+;; phone number) on chats addressed by WhatsApp's anonymous @lid id. Empty = off.
+(define *lidmap-db* (env "WHATSAPPEL_LIDMAP_DB" ""))
+(define *lidmap*    (make-hash-table))   ; lid-number -> phone-number
+
 (define (->list v)
   (cond ((vector? v) (vector->list v)) ((list? v) v) (else '())))
+
+;; Read lid->phone from wuzapi's whatsmeow_lid_map via the sqlite3 CLI (read-only).
+(define (load-lid-map!)
+  (let ((h (make-hash-table)))
+    (when (and (string? *lidmap-db*) (> (string-length *lidmap-db*) 0)
+               (file-exists? *lidmap-db*))
+      (catch #t
+        (lambda ()
+          (let* ((q   "SELECT lid, pn FROM whatsmeow_lid_map;")
+                 (cmd (string-append "sqlite3 -readonly -noheader -separator '|' '"
+                                     *lidmap-db* "' \"" q "\" 2>/dev/null"))
+                 (port (open-input-pipe cmd)))
+            (let loop ()
+              (let ((line (read-line port)))
+                (unless (eof-object? line)
+                  (let ((bar (string-index line #\|)))
+                    (when (and bar (> bar 0))
+                      (hash-set! h (substring line 0 bar) (substring line (1+ bar)))))
+                  (loop))))
+            (close-pipe port)))
+        (lambda (k . a)
+          (format #t "whatsappel: lid-map load failed: ~a ~a~%" k a))))
+    (format #t "whatsappel: lid-map entries: ~a~%" (hash-count (const #t) h))
+    h))
 
 ;; Percent-encode a chat jid for use in a query string ("@" -> "%40", etc.).
 (define (uri-encode s)
@@ -375,7 +407,17 @@
                     (let ((nm (assoc-ref (car ms) "name")))
                       (if (and (not (assoc-ref (car ms) "me")) (string? nm) (> (string-length nm) 0))
                           (hash-set! *names* key nm)
-                          (loop (cdr ms))))))))))))))
+                          (loop (cdr ms)))))))
+              ;; Still unnamed and this is an @lid chat? Map lid -> phone, then
+              ;; phone -> contact name; failing that, show the real phone number,
+              ;; which is far more useful than the opaque lid.
+              (when (and (not (hash-ref *names* key #f))
+                         (string-contains jid "@lid"))
+                (let ((phone (hash-ref *lidmap* key #f)))
+                  (when (string? phone)
+                    (hash-set! *names* key
+                               (or (hash-ref *names* phone #f)
+                                   (string-append "+" phone)))))))))))))
 
 ;; Pull every chat's history from wuzapi into the store. Safe to call repeatedly.
 (define (sync-history!)
@@ -387,6 +429,7 @@
           (catch #t
             (lambda ()
               (load-names!)
+              (set! *lidmap* (load-lid-map!))
               (call-with-values
                   (lambda () (wuzapi-request 'GET "/chat/history?chat_jid=index" #f))
                 (lambda (st parsed raw)

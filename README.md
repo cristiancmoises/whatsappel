@@ -140,6 +140,8 @@ without them. Generate the bridge token with `openssl rand -hex 32`.
 | `WHATSAPPEL_PUBLIC_URL` | `http://HOST:PORT` | URL wuzapi calls back for webhooks |
 | `WHATSAPPEL_SUBSCRIBE` | `Message` | wuzapi events to subscribe |
 | `WHATSAPPEL_CHAT_CAP` | `500` | messages retained per chat |
+| `WHATSAPPEL_HISTORY` | `200` | per-chat history depth pulled from wuzapi |
+| `WHATSAPPEL_LIDMAP_DB` | *(empty)* | path to wuzapi's `main.db`; read read-only to resolve `@lid` chats to phone/name (empty = off) |
 | `WUZAPI_BASE_URL` | `http://127.0.0.1:8080` | wuzapi base URL |
 | `WUZAPI_TOKEN` | *(required)* | wuzapi per-user token |
 | `WUZAPI_TOKEN_HEADER` | `Token` | header carrying the user token |
@@ -233,6 +235,16 @@ the two can never drift — this is the recommended wiring:
 
 ## Behaviour notes (honest limits)
 
+- **Existing chats on link.** After you link a device, the bridge imports your
+  conversations from wuzapi's history store on startup (and on demand via
+  `POST /sync`), so the chat list and past messages appear without waiting for a
+  live message. This needs wuzapi history retention enabled for the user
+  (`POST /session/history {"history": N}`).
+- **`@lid` names.** Chats addressed by WhatsApp's anonymous linked-ID (`@lid`)
+  have no phone number in the history rows. Point `WHATSAPPEL_LIDMAP_DB` at
+  wuzapi's `main.db` and the bridge reads its `whatsmeow_lid_map` (read-only) to
+  resolve them to a saved contact name, or failing that the real phone number.
+  Without it, such chats show their raw id until a live message supplies a name.
 - Outbound media is shown in the conversation as a `[kind] caption` placeholder —
   the bytes you sent are not stored back, so they are not re-rendered inline.
 - Inbound media rendering is best-effort: the bridge extracts wuzapi's media
