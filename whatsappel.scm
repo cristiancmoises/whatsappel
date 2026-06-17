@@ -228,6 +228,7 @@
 (define (media-dl-fields mm)
   (filter-false
    (list (cons "Url"           (jget mm "url" "URL" "Url"))
+         (cons "DirectPath"    (jget mm "directPath" "DirectPath" "direct_path"))
          (cons "MediaKey"      (jget mm "mediaKey" "MediaKey"))
          (cons "Mimetype"      (jget mm "mimetype" "Mimetype" "mimeType"))
          (cons "FileSHA256"    (jget mm "fileSha256" "FileSHA256" "fileSHA256"))
@@ -358,29 +359,41 @@
                (hash-set! *names* (normalize-jid jid) nm))))
          (->list groups))))))
 
-;; Build a store record from one history row.
+;; Build a store record from one history row. Parses the embedded whatsmeow
+;; event (data_json) once to recover both Info and the media sub-message, so the
+;; client gets the same download fields (Url/DirectPath/MediaKey/...) a live
+;; webhook would carry. Old media may still 403 at download time (WhatsApp CDN
+;; expiry); recent/in-window media downloads and renders normally.
 (define (history-row->rec row)
   (let* ((dj     (assoc-ref row "data_json"))
-         (info   (and (string? dj)
-                      (let ((p (safe-json-parse dj))) (and (pair? p) (assoc-ref p "Info")))))
+         (parsed (and (string? dj) (safe-json-parse dj)))
+         (info   (and (pair? parsed) (assoc-ref parsed "Info")))
+         (msg    (and (pair? parsed) (assoc-ref parsed "Message")))
          (fromme (and (pair? info) (eq? #t (assoc-ref info "IsFromMe"))))
          (name   (and (pair? info) (assoc-ref info "PushName")))
          (mtype  (assoc-ref row "message_type"))
          (text   (assoc-ref row "text_content"))
          (ts     (or (and (pair? info) (assoc-ref info "Timestamp"))
                      (assoc-ref row "timestamp"))))
-    (filter-false
-     (list (cons "from" (if fromme "me" (assoc-ref row "sender_jid")))
-           (cons "me"   (and fromme #t))
-           (cons "chat" (assoc-ref row "chat_jid"))
-           (cons "name" (and (string? name) (> (string-length name) 0) name))
-           (cons "id"   (assoc-ref row "message_id"))
-           (cons "ts"   ts)
-           (cons "text" text)
-           (cons "kind" (cond ((pq-text? text) "pq")
-                              ((and (string? mtype) (not (string=? mtype "text"))) mtype)
-                              (else #f)))
-           (cons "caption" (and (string? mtype) (not (string=? mtype "text")) text))))))
+    (call-with-values (lambda () (detect-media (or msg '())))
+      (lambda (mkind mm mcap)
+        (filter-false
+         (list (cons "from" (if fromme "me" (assoc-ref row "sender_jid")))
+               (cons "me"   (and fromme #t))
+               (cons "chat" (assoc-ref row "chat_jid"))
+               (cons "name" (and (string? name) (> (string-length name) 0) name))
+               (cons "id"   (assoc-ref row "message_id"))
+               (cons "ts"   ts)
+               ;; Show real text only for non-media (avoid wuzapi's ":image:" stub).
+               (cons "text" (and (or (not mkind) (pq-text? text)) text))
+               (cons "kind" (cond ((pq-text? text) "pq")
+                                  (mkind mkind)
+                                  ((and (string? mtype) (not (string=? mtype "text"))) mtype)
+                                  (else #f)))
+               (cons "caption" (or mcap
+                                   (and (string? mtype) (not (string=? mtype "text"))
+                                        (not (string-prefix? ":" (or text ""))) text)))
+               (cons "media" (and mm (media-dl-fields mm)))))))))
 
 (define (import-chat! jid)
   (call-with-values
@@ -543,17 +556,53 @@
     (if (not (pair? o))
         (json-response 400 '(("error" . "bad body")))
         (let ((wpath (cond ((equal? kind "video")    "/chat/downloadvideo")
+                           ((equal? kind "gif")      "/chat/downloadvideo")
                            ((equal? kind "audio")    "/chat/downloadaudio")
                            ((equal? kind "document") "/chat/downloaddocument")
+                           ((equal? kind "sticker")  "/chat/downloadsticker")
                            (else "/chat/downloadimage"))))
           (relay 'POST wpath
                  (filter-false
                   (list (cons "Url"           (assoc-ref o "Url"))
+                        (cons "DirectPath"    (assoc-ref o "DirectPath"))
                         (cons "MediaKey"      (assoc-ref o "MediaKey"))
                         (cons "Mimetype"      (assoc-ref o "Mimetype"))
                         (cons "FileSHA256"    (assoc-ref o "FileSHA256"))
                         (cons "FileLength"    (assoc-ref o "FileLength"))
                         (cons "FileEncSHA256" (assoc-ref o "FileEncSHA256")))))))))
+
+;; --- telega-style actions: react / unreact / delete / mark read --------------
+(define (handle-react body-str)
+  (let* ((o     (safe-json-parse body-str))
+         (to    (and (pair? o) (assoc-ref o "to")))
+         (id    (and (pair? o) (assoc-ref o "id")))
+         (emoji (or (and (pair? o) (assoc-ref o "emoji")) ""))
+         (mine  (and (pair? o) (eq? #t (assoc-ref o "me"))))
+         (mid   (if mine (string-append "me:" (or id "")) id)))
+    (if (or (not (string? to)) (not (string? id)))
+        (json-response 400 '(("error" . "missing 'to' or 'id'")))
+        (relay 'POST "/chat/react"
+               (list (cons "Phone" to) (cons "Id" mid) (cons "Body" emoji))))))
+
+(define (handle-delete body-str)
+  (let* ((o    (safe-json-parse body-str))
+         (to   (and (pair? o) (assoc-ref o "to")))
+         (id   (and (pair? o) (assoc-ref o "id")))
+         (mine (and (pair? o) (eq? #t (assoc-ref o "me"))))
+         (mid  (if mine (string-append "me:" (or id "")) id)))
+    (if (or (not (string? to)) (not (string? id)))
+        (json-response 400 '(("error" . "missing 'to' or 'id'")))
+        (relay 'POST "/chat/delete" (list (cons "Phone" to) (cons "Id" mid))))))
+
+(define (handle-markread body-str)
+  (let* ((o  (safe-json-parse body-str))
+         (to (and (pair? o) (assoc-ref o "to")))
+         (id (and (pair? o) (assoc-ref o "id"))))
+    (if (not (string? to))
+        (json-response 400 '(("error" . "missing 'to'")))
+        (relay 'POST "/chat/markread"
+               (list (cons "Id" (if (string? id) (vector id) #()))
+                     (cons "ChatPhone" to))))))
 
 (define (handle-webhook body-str)
   (store-inbound! (extract-message body-str))
@@ -624,6 +673,9 @@
      ((and (eq? method 'POST) (string=? path "/download"))      (handle-download body*))
      ((and (eq? method 'GET)  (string=? path "/chats"))         (handle-chats))
      ((and (eq? method 'GET)  (string=? path "/chat"))          (handle-chat-messages query))
+     ((and (eq? method 'POST) (string=? path "/react"))    (handle-react body*))
+     ((and (eq? method 'POST) (string=? path "/delete"))   (handle-delete body*))
+     ((and (eq? method 'POST) (string=? path "/markread")) (handle-markread body*))
      ((and (eq? method 'POST) (string=? path "/sync"))
       (json-response 200 (list (cons "imported" (sync-history!)))))
      (else (json-response 404 '(("error" . "not found")))))))

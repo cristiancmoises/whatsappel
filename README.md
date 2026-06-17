@@ -59,9 +59,21 @@ unit (`whatsappel.service`) are included. Then load `whatsapp.el` in Emacs (see
   message. `RET` opens a chat.
 - **Chat buffer** (`*WhatsApp: <jid>*`): read-only history above an editable
   input prompt at the bottom. Type and `RET` to send; `C-j` for a newline.
-- **Media model, same as telega**: images and stickers render inline; audio,
-  video and GIFs open in an external player. Inbound images/stickers are
-  downloaded and cached automatically (toggle with `whatsapp-auto-load-images`).
+- **Media model, same as telega**: images and stickers (incl. WebP) render
+  inline, scaled to a sane width (`whatsapp-image-max-width` /
+  `whatsapp-sticker-max-width`); audio, video, GIFs and documents open in an
+  external player. Inbound images/stickers are downloaded and cached
+  automatically (toggle with `whatsapp-auto-load-images`); any media can be saved
+  to a file (`s`). All wuzapi media kinds are supported end to end
+  (image/sticker/video/gif/audio/document), with the correct download endpoint and
+  `DirectPath` per kind.
+- **Telega-style actions** on the message at point (`C-c C-m` menu, or direct
+  keys): react with an emoji, quote-reply, forward to another chat, copy text,
+  save media, delete (for everyone), mark read.
+- **Expired media** (older than WhatsApp's CDN retention — common for history that
+  predates the link) cannot be re-downloaded; it shows an honest
+  `[kind · indisponível — mídia expirada]` label with `RET` to retry. Media
+  received *after* linking downloads and renders normally.
 
 ### Keybindings
 
@@ -83,6 +95,14 @@ Chat buffer (`whatsapp-chat-mode`):
 | `C-j` | newline in input |
 | `C-c C-a` then `i v a f s g` | attach image / video / audio / file / sticker / gif |
 | `RET` or `o` on a media line | download + open that media |
+| `s` on a media line | save that media to a file |
+| `C-c C-m` (or `m` on media) | message action menu (react / reply / forward / copy / save / open / delete / mark read) |
+| `C-c r` | react to the message at point (emoji) |
+| `C-c C-r` | quote-reply to the message at point |
+| `C-c C-f` | forward the message at point to another chat |
+| `C-c C-w` | copy the message text |
+| `C-c C-s` | save the message's media |
+| `C-c C-d` | delete the message (for everyone, if yours) |
 | `C-c C-l` | refresh this chat |
 | `C-c C-e` | compose + send a post-quantum encrypted message |
 | `C-c C-q` | bury buffer |

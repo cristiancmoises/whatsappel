@@ -220,8 +220,10 @@ Return (STATUS . DATA): STATUS the HTTP code or nil, DATA parsed JSON or nil."
     (define-key m (kbd "RET") #'whatsapp-chat-open-media-at-point)
     (define-key m (kbd "o")   #'whatsapp-chat-open-media-at-point)
     (define-key m [mouse-1]   #'whatsapp-chat-open-media-at-point)
+    (define-key m (kbd "s")   #'whatsapp-chat-save-media)
+    (define-key m (kbd "m")   #'whatsapp-chat-message-menu)
     m)
-  "Keymap placed on media lines so RET/o/click open them.")
+  "Keymap placed on media regions: RET/o/click open, s save, m action menu.")
 
 (defun whatsapp--tag-media (beg end media kind id)
   "Tag region BEG..END with MEDIA, KIND, ID and the media keymap."
@@ -237,14 +239,37 @@ Return (STATUS . DATA): STATUS the HTTP code or nil, DATA parsed JSON or nil."
           (if (member kind '("video" "audio" "document" "gif"))
               "  (RET/o to open)" "")))
 
+(defcustom whatsapp-image-max-width 400
+  "Maximum width (px) for inline images/stickers; nil keeps natural size."
+  :type '(choice (const :tag "Natural size" nil) integer) :group 'whatsapp)
+
+(defcustom whatsapp-sticker-max-width 160
+  "Maximum width (px) for inline stickers."
+  :type '(choice (const :tag "Natural size" nil) integer) :group 'whatsapp)
+
+(defun whatsapp--create-image (bytes type &optional kind)
+  "Create an image from BYTES of TYPE, scaled down per KIND, robust to old Emacs."
+  (let ((maxw (if (equal kind "sticker") whatsapp-sticker-max-width
+                whatsapp-image-max-width)))
+    (or (and maxw (ignore-errors
+                    (create-image bytes type t :max-width maxw :ascent 'center)))
+        (ignore-errors (create-image bytes type t :ascent 'center))
+        (create-image bytes type t))))
+
 (defun whatsapp--insert-image (id kind media cap)
-  "Insert inbound image/sticker inline, or a label on failure."
-  (let* ((uri  (whatsapp--media-data id kind media))
+  "Insert inbound image/sticker inline; on failure, a retryable label.
+The whole region is tagged with MEDIA so RET retries and actions apply."
+  (let* ((beg  (point))
+         (uri  (whatsapp--media-data id kind media))
          (mime (and uri (whatsapp--data-uri-mime uri)))
          (type (and mime (whatsapp--image-type-from-mime mime))))
     (if (and uri type (image-type-available-p type))
-        (insert-image (create-image (whatsapp--data-uri-bytes uri) type t))
-      (insert (whatsapp--media-label kind cap)))
+        (insert-image (whatsapp--create-image (whatsapp--data-uri-bytes uri) type kind))
+      (insert (if uri
+                  (whatsapp--media-label kind cap)
+                (format "[%s · indisponível — mídia expirada no WhatsApp · RET p/ tentar]"
+                        (or kind "media")))))
+    (when media (whatsapp--tag-media beg (point) media kind id))
     (when (and cap (> (length cap) 0)) (insert " " cap))))
 
 (defun whatsapp--insert-message (m)
@@ -285,6 +310,183 @@ at point rather than re-parsing the rendered line."
      (t (insert "[message]")))
     (insert "\n")
     (add-text-properties msg-beg (point) (list 'whatsapp-msg m))))
+
+;;; ---------------------------------------------------------------------------
+;;; Telega-style message actions (react, reply, forward, copy, save, delete)
+;;; ---------------------------------------------------------------------------
+
+(defcustom whatsapp-reactions '("👍" "❤️" "😂" "😮" "😢" "🙏" "🔥" "👏")
+  "Quick-reaction emojis offered by `whatsapp-chat-react'."
+  :type '(repeat string) :group 'whatsapp)
+
+(defun whatsapp--message-at-point ()
+  "Return the message alist at point, scanning the line, or signal an error."
+  (or (get-text-property (point) 'whatsapp-msg)
+      (and (not (bobp)) (get-text-property (1- (point)) 'whatsapp-msg))
+      (save-excursion (beginning-of-line) (get-text-property (point) 'whatsapp-msg))
+      (user-error "Point is not on a message")))
+
+(defun whatsapp--msg-field (m k) "Field K of message alist M." (cdr (assoc k m)))
+
+(defun whatsapp-chat-react (&optional emoji)
+  "React to the message at point with EMOJI (prompted; empty removes it)."
+  (interactive)
+  (let* ((m  (whatsapp--message-at-point))
+         (id (whatsapp--msg-field m "id"))
+         (me (whatsapp--msg-field m "me"))
+         (emoji (or emoji (completing-read "React (empty = remove): "
+                                           whatsapp-reactions nil nil))))
+    (unless (stringp id) (user-error "This message has no id to react to"))
+    (let ((res (whatsapp--request
+                "POST" "/react"
+                (append (list (cons "to" whatsapp-chat--target)
+                              (cons "id" id) (cons "emoji" emoji))
+                        (when me '(("me" . t)))))))
+      (if (whatsapp--ok-p (car res))
+          (message "whatsapp: %s" (if (string= "" emoji) "reaction removed"
+                                    (concat "reacted " emoji)))
+        (user-error "whatsapp: react failed: %S" (cdr res))))))
+
+(defun whatsapp-chat-delete-message ()
+  "Delete the message at point (for everyone when it is yours)."
+  (interactive)
+  (let* ((m  (whatsapp--message-at-point))
+         (id (whatsapp--msg-field m "id"))
+         (me (whatsapp--msg-field m "me")))
+    (unless (stringp id) (user-error "This message has no id"))
+    (when (yes-or-no-p "Delete this message? ")
+      (let ((res (whatsapp--request
+                  "POST" "/delete"
+                  (append (list (cons "to" whatsapp-chat--target) (cons "id" id))
+                          (when me '(("me" . t)))))))
+        (if (whatsapp--ok-p (car res))
+            (progn (message "whatsapp: deleted") (whatsapp-chat-refresh))
+          (user-error "whatsapp: delete failed: %S" (cdr res)))))))
+
+(defun whatsapp-chat-copy-text ()
+  "Copy the text/caption of the message at point to the kill ring."
+  (interactive)
+  (let* ((m (whatsapp--message-at-point))
+         (s (or (whatsapp--msg-field m "text") (whatsapp--msg-field m "caption"))))
+    (unless (and (stringp s) (> (length s) 0)) (user-error "No text to copy"))
+    (kill-new s) (message "whatsapp: copied")))
+
+(defun whatsapp-chat-mark-read ()
+  "Mark the message at point (and this chat) as read."
+  (interactive)
+  (let* ((m (whatsapp--message-at-point)) (id (whatsapp--msg-field m "id")))
+    (whatsapp--request "POST" "/markread"
+                       (append (list (cons "to" whatsapp-chat--target))
+                               (when (stringp id) (list (cons "id" id)))))
+    (message "whatsapp: marked read")))
+
+(defun whatsapp-chat-save-media ()
+  "Download the media of the message at point and save it to a file."
+  (interactive)
+  (let* ((m     (whatsapp--message-at-point))
+         (media (whatsapp--msg-field m "media"))
+         (kind  (whatsapp--msg-field m "kind"))
+         (id    (whatsapp--msg-field m "id")))
+    (unless media (user-error "No media on this message"))
+    (let ((uri (whatsapp--media-data id kind media)))
+      (unless (stringp uri)
+        (user-error "whatsapp: download failed (media may have expired on WhatsApp)"))
+      (let* ((mime  (whatsapp--data-uri-mime uri))
+             (ext   (concat "." (or (cadr (split-string mime "/")) "bin")))
+             (dest  (read-file-name "Save media to: " nil nil nil
+                                    (concat "whatsapp-" (or kind "media") ext))))
+        (let ((coding-system-for-write 'binary))
+          (with-temp-file dest (set-buffer-multibyte nil)
+                          (insert (whatsapp--data-uri-bytes uri))))
+        (message "whatsapp: saved to %s" dest)))))
+
+(defun whatsapp--send-media-to (target kind file &optional caption)
+  "Send FILE as media of KIND (symbol) to TARGET, optional CAPTION.
+Return non-nil on success."
+  (let* ((mime (whatsapp--guess-mime file kind))
+         (data (whatsapp--file->data-uri file mime))
+         (payload (append (list (cons "to" target) (cons "data" data))
+                          (when (and caption (> (length caption) 0))
+                            (list (cons "caption" caption)))
+                          (when (eq kind 'document)
+                            (list (cons "filename" (file-name-nondirectory file))))))
+         (route (pcase kind
+                  ('image "/send/image") ('video "/send/video") ('gif "/send/gif")
+                  ('audio "/send/audio") ('document "/send/document")
+                  ('sticker "/send/sticker") (_ (user-error "Bad media kind")))))
+    (whatsapp--ok-p (car (whatsapp--request "POST" route payload)))))
+
+(defun whatsapp--forward-targets ()
+  "Alist of (DISPLAY . JID) from the last fetched chat list."
+  (mapcar (lambda (c) (cons (or (cdr (assoc "name" c)) (cdr (assoc "jid" c)))
+                            (cdr (assoc "jid" c))))
+          (or whatsapp--chats '())))
+
+(defun whatsapp-chat-forward ()
+  "Forward the message at point (text or media) to another chat."
+  (interactive)
+  (let* ((m       (whatsapp--message-at-point))
+         (text    (or (whatsapp--msg-field m "text") (whatsapp--msg-field m "caption")))
+         (media   (whatsapp--msg-field m "media"))
+         (kind    (whatsapp--msg-field m "kind"))
+         (id      (whatsapp--msg-field m "id"))
+         (targets (whatsapp--forward-targets))
+         (choice  (completing-read "Forward to: " (mapcar #'car targets)))
+         (jid     (or (cdr (assoc choice targets)) choice))
+         (target  (whatsapp--target-of-jid jid)))
+    (cond
+     (media
+      (let ((uri (whatsapp--media-data id kind media)))
+        (unless (stringp uri) (user-error "whatsapp: media download failed (expired?)"))
+        (let* ((mime (whatsapp--data-uri-mime uri))
+               (ext  (concat "." (or (cadr (split-string mime "/")) "bin")))
+               (tmp  (make-temp-file "whatsapp-fwd" nil ext)))
+          (let ((coding-system-for-write 'binary))
+            (with-temp-file tmp (set-buffer-multibyte nil)
+                            (insert (whatsapp--data-uri-bytes uri))))
+          (if (whatsapp--send-media-to target (intern (or kind "image")) tmp text)
+              (message "whatsapp: forwarded to %s" choice)
+            (user-error "whatsapp: forward failed")))))
+     ((and (stringp text) (> (length text) 0))
+      (if (whatsapp--ok-p (car (whatsapp--request
+                                "POST" "/send"
+                                (list (cons "to" target) (cons "body" text)))))
+          (message "whatsapp: forwarded to %s" choice)
+        (user-error "whatsapp: forward failed")))
+     (t (user-error "Nothing to forward")))))
+
+(defun whatsapp-chat-reply ()
+  "Insert a quoted reference to the message at point into the input area.
+This is a textual quote (WhatsApp's native quoted-reply context is not wired);
+type your reply after it and press RET."
+  (interactive)
+  (let* ((m   (whatsapp--message-at-point))
+         (who (or (whatsapp--msg-field m "name") (whatsapp--msg-field m "from") "?"))
+         (txt (or (whatsapp--msg-field m "text") (whatsapp--msg-field m "caption")
+                  (format "[%s]" (or (whatsapp--msg-field m "kind") "msg")))))
+    (when (and whatsapp-chat--input-marker
+               (marker-position whatsapp-chat--input-marker))
+      (goto-char (point-max))
+      (insert (format "> %s: %s\n" who
+                      (truncate-string-to-width (replace-regexp-in-string "\n" " " txt) 80)))
+      (message "whatsapp: quote inserted — type your reply, then RET"))))
+
+(defun whatsapp-chat-message-menu ()
+  "Telega-style action menu for the message at point."
+  (interactive)
+  (whatsapp--message-at-point)            ; validate point is on a message
+  (pcase (car (read-multiple-choice
+               "Message action"
+               '((?r "react") (?R "reply") (?f "forward") (?c "copy")
+                 (?s "save") (?o "open media") (?d "delete") (?m "mark read"))))
+    (?r (whatsapp-chat-react))
+    (?R (whatsapp-chat-reply))
+    (?f (whatsapp-chat-forward))
+    (?c (whatsapp-chat-copy-text))
+    (?s (whatsapp-chat-save-media))
+    (?o (whatsapp-chat-open-media-at-point))
+    (?d (whatsapp-chat-delete-message))
+    (?m (whatsapp-chat-mark-read))))
 
 (defun whatsapp--target-of-jid (jid)
   "Return the wuzapi Phone target for chat JID."
@@ -421,6 +623,14 @@ at point rather than re-parsing the rendered line."
     (define-key map (kbd "C-c C-a") whatsapp-chat-attach-map)
     (define-key map (kbd "C-c C-l") #'whatsapp-chat-refresh)
     (define-key map (kbd "C-c C-e") #'whatsapp-chat-send-encrypted)
+    ;; Telega-style message actions on the message at point.
+    (define-key map (kbd "C-c C-m") #'whatsapp-chat-message-menu)
+    (define-key map (kbd "C-c r")   #'whatsapp-chat-react)
+    (define-key map (kbd "C-c C-r") #'whatsapp-chat-reply)
+    (define-key map (kbd "C-c C-f") #'whatsapp-chat-forward)
+    (define-key map (kbd "C-c C-w") #'whatsapp-chat-copy-text)
+    (define-key map (kbd "C-c C-s") #'whatsapp-chat-save-media)
+    (define-key map (kbd "C-c C-d") #'whatsapp-chat-delete-message)
     (define-key map (kbd "C-c C-q") #'quit-window)
     map)
   "Keymap for `whatsapp-chat-mode'.

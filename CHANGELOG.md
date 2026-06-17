@@ -3,6 +3,26 @@
 All notable changes to WhatsApp.el are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [3.0.2] — 2026-06-16
+
+### Fixed
+- **Media downloads (images, stickers, video, audio, documents).** The bridge now
+  sends `DirectPath` alongside the URL/keys and routes each kind to the correct
+  wuzapi endpoint — crucially `sticker → /chat/downloadsticker` (it previously hit
+  `/chat/downloadimage` and failed). History rows now carry the same download
+  fields a live webhook would, so any in-window media is downloadable. Verified
+  end to end against fresh media. (Media older than WhatsApp's CDN retention still
+  cannot be re-fetched — shown as an honest, retryable "expired" label.)
+
+### Added
+- **Telega-style message actions** in the client: a `C-c C-m` action menu plus
+  direct keys to react (emoji), quote-reply, forward to another chat, copy text,
+  save media to a file, delete (for everyone, when yours) and mark read. Backed by
+  new bridge endpoints `POST /react`, `/delete`, `/markread`.
+- **Inline media polish**: WebP stickers and images render inline scaled to
+  `whatsapp-image-max-width` / `whatsapp-sticker-max-width`; media regions are
+  click/`RET`-to-open and `s`-to-save.
+
 ## [3.0.1] — 2026-06-16
 
 ### Added
