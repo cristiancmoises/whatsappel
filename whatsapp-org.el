@@ -5,7 +5,7 @@
 ;;
 ;; Author: Cristian Cezar Moisés
 ;; URL: https://codeberg.org/berkeley/whatsappel
-;; Version: 3.0.0
+;; Version: 3.0.3
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: comm, whatsapp, org
 
