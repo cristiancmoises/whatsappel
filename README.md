@@ -2,7 +2,7 @@
 
 <img src="assets/logo.png" alt="whatsappel" width="200">
 
-# whatsapp.el — telega-style Emacs WhatsApp client
+# WhatsAppel 3.1 — WhatsApp in Emacs
 
 **Guile bridge · wuzapi engine · no Baileys · no JavaScript**
 
@@ -23,6 +23,27 @@ WhatsApp multi-device protocol itself is delegated to **wuzapi**
 that protocol (Noise + the Signal double-ratchet + WhatsApp protobufs) has no Guile
 implementation and a hand-rolled one would be a homemade-crypto liability. No
 JavaScript anywhere.
+
+## 3.1 upgrade
+
+A native dashboard with clickable actions, chat filtering, a command palette and
+an explicit original-file attachment path makes everyday use easier. Background
+refresh is asynchronous, concurrent polls are suppressed, unchanged history is
+not rebuilt, and image prefetch and memory caches are bounded. Existing compose,
+reply, reaction and Org commands remain available.
+
+- [User guide: English](docs/USAGE.md) · [Guia: português brasileiro](docs/USAGE.pt-BR.md)
+- [Apply and publish with fish](docs/DEPLOY.md) · [Audit and validation](docs/AUDIT.md)
+- [Executed upgrade specification](docs/UPGRADE_PROMPT.md)
+
+**Original images:** choose **Original** to send the original bytes as a document.
+This avoids the image delivery recompression path. Inline preview size does not
+change the file. Unsupported image/video/audio formats are sent as documents;
+no implicit conversion or relabeling pretends they are supported native media.
+
+This is a reviewed upgrade candidate. Local and mocked integration results are
+recorded in the audit; live linking, delivery and your deployed wuzapi version
+still need a smoke test on your machine.
 
 ## Architecture
 
@@ -156,7 +177,11 @@ guile whatsappel.scm
 ```
 
 `WHATSAPPEL_TOKEN` and `WUZAPI_TOKEN` are required; the bridge refuses to start
-without them. Generate the bridge token with `openssl rand -hex 32`.
+without them. The bridge token needs at least 16 URL-safe ASCII characters
+(letters, digits, `_`, `-`). Generate one with `openssl rand -hex 32`.
+Incoming body limits apply after the Guile server buffers the request. Keep the
+bridge local; upstream requests remain synchronous and need separate network
+timeout/ingress protection for any network-facing deployment.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -167,6 +192,9 @@ without them. Generate the bridge token with `openssl rand -hex 32`.
 | `WHATSAPPEL_SUBSCRIBE` | `Message` | wuzapi events to subscribe |
 | `WHATSAPPEL_CHAT_CAP` | `500` | messages retained per chat |
 | `WHATSAPPEL_HISTORY` | `200` | per-chat history depth pulled from wuzapi |
+| `WHATSAPPEL_MAX_CHATS` | `1000` | maximum retained chats |
+| `WHATSAPPEL_MAX_BODY_BYTES` | `25165824` | application body/upstream response limit (24 MiB) |
+| `WHATSAPPEL_MAX_MEDIA_BYTES` | `16777216` | media payload limit (16 MiB) |
 | `WHATSAPPEL_LIDMAP_DB` | *(empty)* | path to wuzapi's `main.db`; read read-only to resolve `@lid` chats to phone/name (empty = off) |
 | `WUZAPI_BASE_URL` | `http://127.0.0.1:8080` | wuzapi base URL |
 | `WUZAPI_TOKEN` | *(required)* | wuzapi per-user token |
@@ -275,20 +303,20 @@ the two can never drift — this is the recommended wiring:
   the bytes you sent are not stored back, so they are not re-rendered inline.
 - Inbound media rendering is best-effort: the bridge extracts wuzapi's media
   download fields from the webhook event defensively across key-casing variants,
-  and always preserves the raw event. If a build's event schema differs, the
+  without retaining the entire raw event in memory. If a build's event schema differs, the
   message still appears as a labelled placeholder rather than failing.
-- GIFs are sent through the video endpoint (WhatsApp represents GIFs as looping
-  MP4 videos).
-- The interactive buffer behaviour is not exercised by the build's automated
-  tests (headless, no display); the client byte-compiles clean and its pure
-  helpers are unit-tested, and the bridge is integration-tested end to end.
+- MP4 files requested as GIF mode use video delivery; the checked stock wuzapi
+  does not expose a looping option. Actual `.gif` files
+  use document delivery; the client does not silently transcode them.
+- Tests cover buffer state and mocked HTTP integration. See the audit for exact
+  tool versions, counts, graphical checks and the remaining live-device checks.
 
 ## Security model
 
 **Protects**
 - The Emacs-facing API requires `X-Whatsappel-Token`; the inbound webhook is
-  reachable only at `/hook/<token>`. Token comparison is constant-time. Bridge
-  and wuzapi both bind to loopback. Transport inherits WhatsApp's own E2EE.
+  reachable only at `/hook/<token>`. Token comparison visits every byte after a length check; this is not a formal
+  constant-time guarantee in Guile. Bridge and wuzapi default to loopback. Transport inherits WhatsApp's own E2EE.
 
 **Does NOT protect against**
 - A compromised host: the bridge and wuzapi see plaintext locally.
@@ -338,6 +366,7 @@ model, wire formats, and the WAPQR handshake.
 | Role | URL |
 |---|---|
 | **Official** (Forgejo) | <https://git.securityops.co/cristiancmoises/whatsappel> |
+| Mirror (Forgejo BR) | <https://git.securityops.com.br/cristiancmoises/whatsappel> |
 | Mirror (Codeberg) | <https://codeberg.org/berkeley/whatsappel> |
 | Mirror (GitHub) | <https://github.com/cristiancmoises/whatsappel> |
 

@@ -21,17 +21,21 @@ checks at open time. The metadata is covered by both the signature and the AEAD
 AAD, so it cannot be altered without rejection.
 
 Primitives are [libcrux](https://github.com/cryspen/libcrux) (`libcrux-ml-kem`,
-`libcrux-ml-dsa`), whose field/NTT/serialization code is formally verified with
-hax and F*. This crate only *composes* them; it reimplements no primitive. The
-crate root is `#![forbid(unsafe_code)]`; key material is held in `Zeroizing`
-buffers; all randomness comes from the OS CSPRNG via `getrandom`. libcrux is
-pre-1.0 — pin the version and re-audit on bumps.
+`libcrux-ml-dsa`, currently 0.0.10). Upstream verification applies to specific
+implementations and proof assumptions; it does not verify this protocol, its CLI,
+or every dependency/backend. This crate composes existing primitives and forbids
+unsafe Rust in its own source. Explicit secret buffers use `Zeroizing`; that does
+not guarantee erasure of compiler copies, upstream key objects, swap or backups.
+Randomness comes from the OS CSPRNG via `getrandom`. Commit Cargo.lock and re-audit
+on dependency changes.
 
 ## Identity
 
 Each user has two key pairs: an ML-KEM pair (others encapsulate to your public
 key to send to you) and an ML-DSA pair (you sign what you send). `keygen` writes
-`NAME.public` (shareable) and `NAME.secret` (mode 0600).
+`NAME.public` (shareable) and `NAME.secret` (mode 0600). Existing keys are
+refused, including when only one member of a pair exists. Choose a new identity
+prefix to rotate keys; verify the new fingerprint with contacts.
 
 ## CLI
 
@@ -63,13 +67,15 @@ exits with status **3**, distinct from other failures (exit 1).
 ## Build
 
 ```
-cargo build --release       # binary at target/release/pqenv
-cargo test                  # RFC 5869 + RFC 8439 vectors and composition tests
-cargo clippy -- -D warnings
+cargo build --release --locked       # binary at target/release/pqenv
+cargo test --locked         # RFC 5869 + RFC 8439 vectors and composition tests
+cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-Rust ≥ 1.78 (libcrux MSRV). Tested on stable 1.96.
+Rust ≥ 1.89 is required for standard-library OS file locks. This revision was
+tested with Rust 1.93.0 on x86_64 Linux; the minimum toolchain and other
+architectures were not exercised in this review.
 
 ## Wire format
 
@@ -138,7 +144,7 @@ only to support freshness and replay checks.
 A stateful, opt-in session layer that adds forward secrecy. Primitives are the
 same (ML-KEM-1024, ML-DSA-87, ChaCha20-Poly1305, HKDF-SHA256).
 
-Handshake (PQXDH-style, one signed one-time prekey):
+Custom handshake (one signed one-time prekey; **not Signal PQXDH**):
 
 ```
 # responder publishes a one-time prekey, signed by its long-term identity
@@ -183,9 +189,43 @@ since only the two peers hold the ratchet keys.
 - Metadata and endpoint exposure: unchanged from the envelope above.
 - Group messaging: 1:1 only; no group keying.
 
+## State and file handling
+
+Put identities, session files and replay databases in a directory owned by you
+with mode 0700 on a local filesystem. Stateful commands use persistent `.lock`
+files and OS advisory locks. A busy operation fails instead of processing the
+same chain key twice; retry after the other operation completes. Do not delete
+lock files while any process may use them, and do not mix this revision with an
+older binary that ignores locks. Symlinked or multiply hardlinked state is
+refused. Directory control and backup rollback remain outside this protection.
+
+Updates use mode-0600 random temporary files, file `fsync`, atomic rename and
+parent-directory `fsync`. An existing ordinary `--out` file can be atomically
+replaced, including Emacs-created temporaries; `--out` cannot name a key/session/
+replay file passed to the same command. Newly created identities, prekeys and
+sessions refuse overwrite. Output redirection (`> file`) is controlled by your
+shell and its umask, so use `umask 077` for private plaintext.
+
+`ratchet-accept` durably writes a `.prekey.secret.consumed` marker before saving
+its session and deleting the prekey secret. Keep that marker: it blocks accidental
+reuse after a crash even if the old secret remains. If acceptance fails after the
+marker was written, generate a fresh prekey and start a new handshake. Deleting a
+secret file does not securely erase SSD, journal, snapshot or backup copies.
+
+Session advancement is persisted before ciphertext/plaintext output. A later
+output failure may lose that message; restoring older state to retry risks key
+reuse. The CLI is not a transactional network transport. Corrupted/unreadable
+replay stores and malformed freshness options fail closed. Replay stores require
+application-level retention and remain device-local.
+
+The CLI reads at most 32 MiB per input. Envelope plaintext is limited to 24 MiB
+minus 8 KiB to leave room for headers and base64; ratchet plaintext is limited to
+32 MiB minus 64 bytes. WhatsApp text transport imposes much smaller practical
+limits. These limits do not apply to the bridge's normal attachment uploads.
+
 ## Security testing and audit
 
-Test surface (`cargo test`, 27 tests):
+Test surface (`cargo test --locked`, 39 tests on 2026-09-09):
 - Known-answer vectors: HKDF-SHA256 (RFC 5869), ChaCha20-Poly1305 tag (RFC 8439).
 - Envelope: roundtrip, tamper rejection, wrong-sender / wrong-recipient rejection,
   freshness metadata presence/uniqueness.
@@ -198,26 +238,26 @@ Test surface (`cargo test`, 27 tests):
   in-order message stream delivered in an arbitrary permutation decrypts exactly
   once per message.
 
-Dependency advisory audit: the resolved tree (release and dev) was checked against
-the RustSec advisory database by version range. Result: zero unpatched advisories.
-The recent libcrux ML-DSA verification advisories — RUSTSEC-2026-0076 (hint-decode
-out-of-bounds panic) and 2026-0077 (signer-response norm check), patched in 0.0.8,
-and 2026-0125 (AVX2 `use_hint` edge case), patched in 0.0.9 — are the reason the
-ML-KEM/ML-DSA pins are `0.0.9`. Re-run advisory checks on every dependency bump.
+Additional regression coverage checks strict binary parsing, counter overflow
+without mutation, duplicate skipped keys, process locking, mode-0600 atomic
+replacement, symlink/hardlink rejection, identity overwrite refusal, malformed
+freshness flags, corrupted replay databases, and consumed-prekey recovery.
 
-Constant-time and memory posture: secret comparisons and branches are delegated to
-vetted constant-time code — AEAD tag verification (RustCrypto `subtle`), ML-KEM
-implicit-rejection decapsulation and ML-DSA verification (libcrux). This layer adds
-no secret-dependent branch or index; the only direct comparison is on the public
-session id. All key material — identity secrets, KEM shared secrets, root/chain/
-message keys, and serialized session state — is held in `zeroize::Zeroizing`.
+Dependency audit on **2026-09-09** (`cargo audit`, database commit
+`d502590ca247f3e53b56bf6c2ae40b61926800e5`): **0 vulnerability advisories**, with
+**1 maintenance warning** for transitive `proc-macro-error2` 2.0.1
+([RUSTSEC-2026-0173](https://rustsec.org/advisories/RUSTSEC-2026-0173.html)).
+The original lockfile reported three vulnerability advisories; this revision
+updates libcrux ML-KEM/ML-DSA to 0.0.10, SHA3 to 0.0.10 and secrets to 0.0.6.
+`anyhow` moves to 1.0.104 to resolve its unsoundness warning; the yanked transitive
+`chacha20` 0.10.0 is replaced by 0.10.2. The independent RustCrypto AEAD still uses
+its compatible `chacha20` 0.9.1 dependency. A database scan does not establish the
+absence of unknown vulnerabilities. See [the dated audit](AUDIT-2026-09-09.md).
 
-Formal verification scope: the primitives carry machine-checked proofs upstream
-(libcrux, via hax/F*). The composition layer here is plain safe Rust
-(`#![forbid(unsafe_code)]`), so the C/assembly-oriented tooling (Jasmin `jasmin-ct`,
-Frama-C/ACSL, EasyCrypt) does not apply to it and was not run; assurance for this
-layer comes from the KAT, property, and advisory checks above, not from an
-independent formal proof or third-party audit.
+This review exercised the default x86_64 build and inspected the composition
+source. It did not prove constant-time behavior, rerun upstream formal proofs,
+perform an independent cryptographic protocol review, run Miri/sanitizers, or test
+AArch64/SIMD backends. No security certification is claimed.
 
 ## License
 

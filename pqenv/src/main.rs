@@ -12,9 +12,9 @@
 
 use std::fmt::Write as _;
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::Write;
+
+mod storage;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -60,19 +60,79 @@ fn flag(args: &[String], name: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned())
 }
 
+fn validate_args(cmd: &str, args: &[String]) -> Result<()> {
+    let allowed: &[&str] = match cmd {
+        "keygen" => &["--out"],
+        "seal" => &["--recipient", "--identity", "--in", "--out"],
+        "open" => &[
+            "--identity",
+            "--sender",
+            "--in",
+            "--out",
+            "--max-age",
+            "--seen",
+        ],
+        "fingerprint" => &["--public"],
+        "ratchet-prekey" => &["--identity", "--out"],
+        "ratchet-init" => &["--identity", "--peer", "--prekey", "--session", "--out"],
+        "ratchet-accept" => &["--peer", "--prekey-secret", "--init", "--session"],
+        "ratchet-send" | "ratchet-recv" => &["--session", "--in", "--out"],
+        _ => return Ok(()),
+    };
+    if cmd == "fingerprint" && args.len() == 1 && !args[0].starts_with("--") {
+        return Ok(());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for pair in args.chunks(2) {
+        if pair.len() != 2
+            || !allowed.contains(&pair[0].as_str())
+            || pair[1].starts_with("--")
+            || !seen.insert(&pair[0])
+        {
+            return Err(
+                format!("unknown, duplicate, or missing-value argument: {}", pair[0]).into(),
+            );
+        }
+    }
+    if !["keygen", "ratchet-prekey"].contains(&cmd) {
+        if let Some(out) = flag(args, "--out") {
+            let output = storage::resolved(&out)?;
+            for key in [
+                "--identity",
+                "--recipient",
+                "--sender",
+                "--peer",
+                "--prekey",
+                "--prekey-secret",
+                "--session",
+                "--seen",
+            ] {
+                if let Some(path) = flag(args, key) {
+                    if output == storage::resolved(&path)?
+                        || output == storage::resolved(&format!("{path}.lock"))?
+                    {
+                        return Err(
+                            format!("--out must not overwrite {key} or its lock file").into()
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn read_input(args: &[String]) -> Result<Vec<u8>> {
     if let Some(path) = flag(args, "--in") {
-        Ok(fs::read(path)?)
+        storage::read(&path)
     } else {
-        let mut buf = Vec::new();
-        std::io::stdin().read_to_end(&mut buf)?;
-        Ok(buf)
+        storage::read_limited(std::io::stdin().lock())
     }
 }
 
 fn write_output(args: &[String], data: &[u8]) -> Result<()> {
     if let Some(path) = flag(args, "--out") {
-        fs::write(path, data)?;
+        storage::replace(&path, data)?;
     } else {
         std::io::stdout().write_all(data)?;
     }
@@ -85,7 +145,7 @@ fn write_public(path: &str, kem_pk: &[u8], sig_pk: &[u8]) -> Result<()> {
         B64.encode(kem_pk),
         B64.encode(sig_pk)
     );
-    fs::write(path, body)?;
+    storage::write_new(path, body.as_bytes(), 0o644)?;
     Ok(())
 }
 
@@ -103,19 +163,14 @@ fn write_secret(
         B64.encode(kem_pk),
         B64.encode(sig_pk)
     ));
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(body.as_bytes())?;
+    storage::write_new(path, body.as_bytes(), 0o600)?;
     Ok(())
 }
 
-// Parse a key file into (label, bytes) pairs.
-fn read_keyfile(path: &str) -> Result<Vec<(String, Vec<u8>)>> {
-    let text = Zeroizing::new(fs::read_to_string(path)?);
+// Parse a key file into (label, bytes) pairs, wiping decoded secrets on drop.
+type KeyFields = Zeroizing<Vec<(String, Vec<u8>)>>;
+fn read_keyfile(path: &str) -> Result<KeyFields> {
+    let text = Zeroizing::new(String::from_utf8(storage::read(path)?)?);
     let mut out = Vec::new();
     for line in text.lines() {
         if let Some((label, value)) = line.split_once(": ") {
@@ -125,7 +180,7 @@ fn read_keyfile(path: &str) -> Result<Vec<(String, Vec<u8>)>> {
             out.push((label.trim().to_string(), bytes));
         }
     }
-    Ok(out)
+    Ok(Zeroizing::new(out))
 }
 
 fn field(fields: &[(String, Vec<u8>)], label: &str) -> Result<Vec<u8>> {
@@ -138,6 +193,12 @@ fn field(fields: &[(String, Vec<u8>)], label: &str) -> Result<Vec<u8>> {
 
 fn cmd_keygen(args: &[String]) -> Result<()> {
     let out = flag(args, "--out").ok_or("keygen requires --out NAME")?;
+    let _guard = storage::lock(&out)?;
+    for suffix in ["public", "secret"] {
+        if fs::symlink_metadata(format!("{out}.{suffix}")).is_ok() {
+            return Err(format!("refusing to overwrite {out}.{suffix}").into());
+        }
+    }
     let id = keygen()?;
     write_public(&format!("{out}.public"), &id.kem_pk, &id.sig_pk)?;
     write_secret(
@@ -160,6 +221,9 @@ fn cmd_seal(args: &[String]) -> Result<()> {
     let recipient_kem_pk = field(&rfields, "kem_pk")?;
     let sender_sig_sk = Zeroizing::new(field(&ifields, "sig_sk")?);
     let plaintext = Zeroizing::new(read_input(args)?);
+    if plaintext.len() > 24 * 1024 * 1024 - 8192 {
+        return Err("plaintext exceeds envelope CLI limit (24 MiB minus 8 KiB)".into());
+    }
     let env = seal(&recipient_kem_pk, &sender_sig_sk, &plaintext)?;
     let mut out = format!("{TRANSPORT_PREFIX}{}", B64.encode(&env)).into_bytes();
     out.push(b'\n');
@@ -187,9 +251,7 @@ fn write_seen(path: &str, entries: &[(u64, String)]) -> Result<()> {
     for (ts, id) in entries {
         let _ = writeln!(body, "{ts} {id}");
     }
-    let tmp = format!("{path}.tmp");
-    fs::write(&tmp, &body)?;
-    fs::rename(&tmp, path)?;
+    storage::replace(path, body.as_bytes())?;
     Ok(())
 }
 
@@ -201,13 +263,25 @@ fn seen_check_and_record(
     msg_ts: u64,
     max_age: Option<u64>,
 ) -> Result<bool> {
+    let _guard = storage::lock(path)?;
     let now = now_unix();
     let mut kept: Vec<(u64, String)> = Vec::new();
     let mut replay = false;
-    if let Ok(text) = fs::read_to_string(path) {
+    let previous = match fs::File::open(path) {
+        Ok(f) => String::from_utf8(storage::read_limited(f)?)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    {
+        let text = previous;
         for line in text.lines() {
             if let Some((ts_s, id)) = line.split_once(' ') {
-                let ts: u64 = ts_s.parse().unwrap_or(0);
+                let ts: u64 = ts_s
+                    .parse()
+                    .map_err(|_| "invalid timestamp in seen store")?;
+                if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err("invalid message id in seen store".into());
+                }
                 if let Some(age) = max_age {
                     if now.saturating_sub(ts) > age {
                         continue; // prune stale entry
@@ -217,6 +291,8 @@ fn seen_check_and_record(
                     replay = true;
                 }
                 kept.push((ts, id.to_string()));
+            } else {
+                return Err("malformed seen store".into());
             }
         }
     }
@@ -229,7 +305,17 @@ fn seen_check_and_record(
     Ok(true)
 }
 
+fn max_age(args: &[String]) -> Result<Option<u64>> {
+    flag(args, "--max-age")
+        .map(|s| {
+            s.parse::<u64>()
+                .map_err(|_| "--max-age must be an unsigned integer".into())
+        })
+        .transpose()
+}
+
 fn cmd_open(args: &[String]) -> Result<()> {
+    let max_age = max_age(args)?;
     let ident = flag(args, "--identity").ok_or("open requires --identity ME.secret")?;
     let sender = flag(args, "--sender").ok_or("open requires --sender BOB.public")?;
     let ifields = read_keyfile(&ident)?;
@@ -248,7 +334,6 @@ fn cmd_open(args: &[String]) -> Result<()> {
         .map_err(|e| format!("bad base64 envelope: {e}"))?;
 
     let opened = open(&my_kem_sk, &sender_sig_pk, &env)?;
-    let max_age = flag(args, "--max-age").and_then(|s| s.parse::<u64>().ok());
 
     // Freshness window (exit 3 distinguishes replay/stale from other failures).
     if let (Some(age), Some(ts)) = (max_age, opened.ts) {
@@ -286,25 +371,20 @@ fn cmd_fingerprint(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn write_mode(path: &str, data: &[u8], mode: u32) -> Result<()> {
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(mode)
-        .open(path)?;
-    f.write_all(data)?;
-    Ok(())
-}
-
 fn cmd_ratchet_prekey(args: &[String]) -> Result<()> {
     let ident = flag(args, "--identity").ok_or("ratchet-prekey requires --identity ME.secret")?;
     let out = flag(args, "--out").ok_or("ratchet-prekey requires --out NAME")?;
     let ifields = read_keyfile(&ident)?;
     let sig_sk = Zeroizing::new(field(&ifields, "sig_sk")?);
+    let _guard = storage::lock(&out)?;
+    for suffix in ["prekey", "prekey.secret"] {
+        if fs::symlink_metadata(format!("{out}.{suffix}")).is_ok() {
+            return Err(format!("refusing to overwrite {out}.{suffix}").into());
+        }
+    }
     let (pubb, secb) = ratchet::gen_prekey(&sig_sk)?;
-    write_mode(&format!("{out}.prekey"), &pubb, 0o644)?;
-    write_mode(&format!("{out}.prekey.secret"), &secb, 0o600)?;
+    storage::write_new(&format!("{out}.prekey"), &pubb, 0o644)?;
+    storage::write_new(&format!("{out}.prekey.secret"), &secb, 0o600)?;
     eprintln!("wrote {out}.prekey (share once) and {out}.prekey.secret (0600, one-time)");
     Ok(())
 }
@@ -318,9 +398,9 @@ fn cmd_ratchet_init(args: &[String]) -> Result<()> {
     let pfields = read_keyfile(&peer)?;
     let my_sig_sk = Zeroizing::new(field(&ifields, "sig_sk")?);
     let peer_sig_pk = field(&pfields, "sig_pk")?;
-    let prekey_pub = fs::read(&prekey)?;
+    let prekey_pub = storage::read(&prekey)?;
     let (sess, token) = ratchet::init(&my_sig_sk, &peer_sig_pk, &prekey_pub)?;
-    write_mode(&session, &sess, 0o600)?;
+    storage::write_new(&session, &sess, 0o600)?;
     write_output(args, &token)?;
     eprintln!("wrote {session} (0600); send the init token to the peer");
     Ok(())
@@ -334,37 +414,55 @@ fn cmd_ratchet_accept(args: &[String]) -> Result<()> {
     let session = flag(args, "--session").ok_or("ratchet-accept requires --session OUT.session")?;
     let pfields = read_keyfile(&peer)?;
     let peer_sig_pk = field(&pfields, "sig_pk")?;
-    let prekey_secret = Zeroizing::new(fs::read(&psec)?);
-    let init_token = fs::read(&initf)?;
+    let _guard = storage::lock(&psec)?;
+    let prekey_secret = Zeroizing::new(storage::read(&psec)?);
+    let init_token = storage::read(&initf)?;
     let sess = ratchet::accept(&peer_sig_pk, &prekey_secret, &init_token)?;
-    write_mode(&session, &sess, 0o600)?;
+    if fs::symlink_metadata(&session).is_ok() {
+        return Err("refusing to overwrite an existing session".into());
+    }
+    // A durable public tombstone closes the crash window between persisting
+    // the session and deleting its one-time bootstrap secret.  If a later write
+    // fails, start with a fresh prekey; never remove this marker to retry.
+    storage::write_new(
+        &format!("{psec}.consumed"),
+        b"one-time prekey consumed\n",
+        0o600,
+    )?;
+    storage::write_new(&session, &sess, 0o600)?;
     // One-time prekey: consume it so it can never seed a second session.
-    fs::remove_file(&psec).ok();
+    fs::remove_file(&psec)?;
+    storage::sync_parent(&psec)?;
     eprintln!("wrote {session} (0600); consumed (deleted) one-time prekey secret {psec}");
     Ok(())
 }
 
 fn cmd_ratchet_send(args: &[String]) -> Result<()> {
     let session = flag(args, "--session").ok_or("ratchet-send requires --session S.session")?;
-    let blob = Zeroizing::new(fs::read(&session)?);
+    let _guard = storage::lock(&session)?;
+    let blob = Zeroizing::new(storage::read(&session)?);
     let mut s = ratchet::Session::from_bytes(&blob)?;
     let pt = Zeroizing::new(read_input(args)?);
+    if pt.len() as u64 > storage::MAX_INPUT - 64 {
+        return Err("plaintext exceeds ratchet CLI limit (32 MiB minus 64 bytes)".into());
+    }
     let msg = s.encrypt(&pt)?;
-    write_mode(&session, &s.to_bytes(), 0o600)?;
+    storage::replace(&session, &s.to_bytes())?;
     write_output(args, &msg)?;
     Ok(())
 }
 
 fn cmd_ratchet_recv(args: &[String]) -> Result<()> {
     let session = flag(args, "--session").ok_or("ratchet-recv requires --session S.session")?;
-    let blob = Zeroizing::new(fs::read(&session)?);
+    let _guard = storage::lock(&session)?;
+    let blob = Zeroizing::new(storage::read(&session)?);
     let mut s = ratchet::Session::from_bytes(&blob)?;
     let msg = read_input(args)?;
     match s.decrypt(&msg) {
         Ok(pt) => {
             let pt = Zeroizing::new(pt);
             // Persist the advanced session only on success.
-            write_mode(&session, &s.to_bytes(), 0o600)?;
+            storage::replace(&session, &s.to_bytes())?;
             write_output(args, &pt)?;
             Ok(())
         }
@@ -379,6 +477,10 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(String::as_str).unwrap_or("");
     let rest: &[String] = if args.len() > 2 { &args[2..] } else { &[] };
+    if let Err(e) = validate_args(cmd, rest) {
+        eprintln!("pqenv: {e}");
+        std::process::exit(2);
+    }
     let result = match cmd {
         "keygen" => cmd_keygen(rest),
         "seal" => cmd_seal(rest),
@@ -401,5 +503,22 @@ fn main() {
     if let Err(e) = result {
         eprintln!("pqenv: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| s.to_string()).collect()
+    }
+    #[test]
+    fn invalid_freshness_settings_fail_closed() {
+        assert!(max_age(&args(&["--max-age", "garbage"])).is_err());
+        assert!(max_age(&args(&["--max-age", "-1"])).is_err());
+        assert_eq!(max_age(&args(&["--max-age", "60"])).unwrap(), Some(60));
+        assert!(validate_args("open", &args(&["--max-age"])).is_err());
+        assert!(validate_args("open", &args(&["--max-age", "1", "--max-age", "2"])).is_err());
+        assert!(validate_args("open", &args(&["--seem", "replay.db"])).is_err());
     }
 }

@@ -14,7 +14,6 @@
 package main
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -75,8 +74,9 @@ func (s *server) MediaRetryRequest() http.HandlerFunc {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New("no active whatsapp session"))
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, 4096)
 		var t struct{ Id string }
-		if err := json.NewDecoder(r.Body).Decode(&t); err != nil || t.Id == "" {
+		if err := json.NewDecoder(r.Body).Decode(&t); err != nil || t.Id == "" || len(t.Id) > 256 {
 			s.Respond(w, r, http.StatusBadRequest, errors.New("missing Id in payload"))
 			return
 		}
@@ -91,7 +91,7 @@ func (s *server) MediaRetryRequest() http.HandlerFunc {
 			ID: t.Id,
 			MessageSource: types.MessageSource{Chat: chat, Sender: sender, IsFromMe: fromMe},
 		}
-		if err := cli.SendMediaRetryReceipt(context.Background(), info, mk); err != nil {
+		if err := cli.SendMediaRetryReceipt(r.Context(), info, mk); err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, err)
 			return
 		}

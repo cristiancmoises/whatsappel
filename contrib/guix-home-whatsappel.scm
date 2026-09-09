@@ -42,11 +42,12 @@
                   (respawn? #t)
                   (start
                    #~(make-forkexec-constructor
-                      (list (string-append (getenv "HOME") "/wuzapi/wuzapi")
-                            "-datadir"
-                            (string-append (getenv "HOME")
-                                           "/.config/whatsappel/wuzapi-data")
-                            "-logtype" "console")
+                      (list #$(file-append bash "/bin/bash") "-c"
+                            (string-append
+                             "set -e; umask 077; set -a; . \"$HOME/wuzapi/.env\"; set +a; "
+                             "exec \"$HOME/wuzapi/wuzapi\" -address 127.0.0.1 -port 8080 "
+                             "-datadir \"$HOME/.config/whatsappel/wuzapi-data\" "
+                             "-logtype console"))
                       #:directory (string-append (getenv "HOME") "/wuzapi")
                       #:log-file (string-append (getenv "HOME")
                                                 "/.config/whatsappel/logs/wuzapi.log")
@@ -62,7 +63,7 @@
                    #~(make-forkexec-constructor
                       (list #$(file-append bash "/bin/bash") "-c"
                             (string-append
-                             "export PATH=\"$HOME/.local/bin:"
+                             "set -e; umask 077; export PATH=\"$HOME/.local/bin:"
                              "/run/current-system/profile/bin:"
                              "$HOME/.guix-home/profile/bin:$PATH\"; "
                              "set -a; . \"$HOME/whatsappel/.env\"; set +a; "

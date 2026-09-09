@@ -2,6 +2,7 @@
 # whatsappel setup — build pqenv, install it, create config, generate a token.
 # Idempotent: safe to re-run; never overwrites an existing .env or PQ keys.
 set -euo pipefail
+umask 077
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="${WHATSAPPEL_BIN:-$HOME/.local/bin}"
@@ -32,7 +33,7 @@ fi
 say "All dependencies present"
 
 say "Building pqenv (release)"
-( cd "$REPO/pqenv" && cargo build --release --quiet )
+( cd "$REPO/pqenv" && cargo build --locked --release --quiet )
 mkdir -p "$BIN"
 install -m 0755 "$REPO/pqenv/target/release/pqenv" "$BIN/pqenv"
 say "Installed pqenv -> $BIN/pqenv"
@@ -40,15 +41,16 @@ case ":$PATH:" in *":$BIN:"*) : ;; *) warn "Add $BIN to your PATH (e.g. in ~/.pr
 
 say "Creating config directories"
 mkdir -p "$CONFIG/pq/contacts"
-chmod 700 "$CONFIG" "$CONFIG/pq" 2>/dev/null || true
+chmod 700 "$CONFIG" "$CONFIG/pq" "$CONFIG/pq/contacts"
 
-if [ -f "$ENV_FILE" ]; then
+if [ -e "$ENV_FILE" ] || [ -L "$ENV_FILE" ]; then
+  [ -f "$ENV_FILE" ] && [ ! -L "$ENV_FILE" ] || die ".env must be a regular non-symlink file"
   say ".env already exists — leaving it untouched"
 else
   say "Generating .env with a fresh bridge token"
   token="$(openssl rand -hex 32 2>/dev/null || head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-  sed -e "s|^export WHATSAPPEL_TOKEN=.*|export WHATSAPPEL_TOKEN=\"$token\"|" \
-      "$REPO/env.example" > "$ENV_FILE"
+  ( set -C; sed -e "s|^export WHATSAPPEL_TOKEN=.*|export WHATSAPPEL_TOKEN=\"$token\"|" \
+      "$REPO/env.example" > "$ENV_FILE" )
   chmod 600 "$ENV_FILE"
   warn "Edit $ENV_FILE and set WUZAPI_TOKEN to your wuzapi user token."
 fi

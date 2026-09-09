@@ -5,7 +5,7 @@
 ;;
 ;; Author: Cristian Cezar Moisés
 ;; URL: https://codeberg.org/berkeley/whatsappel
-;; Version: 3.0.3
+;; Version: 3.1.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: comm, whatsapp, org
 
@@ -20,7 +20,7 @@
 ;; 2. Capture.  `whatsapp-org-capture' (C-c C-o in a chat, or the `o' key of
 ;;    `whatsapp-prefix-map') files the message at point as an Org entry, with
 ;;    the sender, an inactive timestamp, a jump-back link, and the text in a
-;;    quote block.  Post-quantum (`WAPQ1:') messages are captured as their
+;;    literal example block.  Post-quantum (`WAPQ1:') messages are captured as their
 ;;    placeholder unless you have already decrypted them on view — capture
 ;;    never silently reveals plaintext you have not chosen to see.
 ;;
@@ -41,6 +41,10 @@
 (require 'whatsapp)
 (require 'org)
 (require 'org-capture)
+(require 'org-src)
+(require 'cl-lib)
+
+(defvar org-export-allow-bind-keywords)
 
 (declare-function org-export-string-as "ox" (string backend &optional body-only ext-plist))
 (declare-function org-link-store-props "ol" (&rest plist))
@@ -75,8 +79,22 @@ Nil means use `org-default-notes-file'."
   (and (listp m) (cdr (assoc key m))))
 
 (defun whatsapp-org--esc (s)
-  "Escape S for literal use inside an `org-capture' template (double %)."
-  (replace-regexp-in-string "%" "%%" (or s "")))
+  "Escape untrusted S for literal use in an `org-capture' template.
+Org escapes percent placeholders with backslashes.  Preserve any existing
+backslashes while ensuring every placeholder has an odd escape count."
+  (replace-regexp-in-string
+   "\\\\*%"
+   (lambda (match)
+     (concat (make-string (1+ (* 2 (1- (length match)))) ?\\) "%"))
+   (substring-no-properties (or s "")) t t))
+
+(defun whatsapp-org--single-line (s)
+  "Render untrusted S as one line for a heading or property."
+  (replace-regexp-in-string "[\n\r]+" " " (or s "")))
+
+(defun whatsapp-org--literal (s)
+  "Keep untrusted S inside an Org example block, including block markers."
+  (org-escape-code-in-string (or s "")))
 
 (defun whatsapp-org--inactive-ts (ts)
   "Format unix-seconds TS as an Org inactive timestamp, or nil."
@@ -131,7 +149,10 @@ been decrypted on view (present in the plaintext cache)."
      ((and (stringp text) (fboundp 'whatsapp--pq-text-p)
            (whatsapp--pq-text-p text))
       (or (and (boundp 'whatsapp-pq--plain-cache)
-               (gethash text whatsapp-pq--plain-cache))
+               (let ((cached (gethash (list (bound-and-true-p whatsapp-chat--jid)
+                                            (whatsapp-org--field m "id") text)
+                                      whatsapp-pq--plain-cache)))
+                 (and (stringp cached) cached)))
           "[encrypted message — view it in the chat to decrypt before capturing]"))
      ((and (stringp text) (> (length text) 0)) text)
      ((and (stringp kind)
@@ -182,7 +203,10 @@ been decrypted on view (present in the plaintext cache)."
 
 (defun whatsapp-org--capture-template (jid name from ts text)
   "Build a one-off `org-capture-templates' entry for a captured message."
-  (let* ((file  (or whatsapp-org-capture-file org-default-notes-file))
+  (let* ((jid (whatsapp-org--single-line jid))
+         (name (whatsapp-org--single-line name))
+         (from (and from (whatsapp-org--single-line from)))
+         (file  (or whatsapp-org-capture-file org-default-notes-file))
          (stamp (whatsapp-org--inactive-ts ts))
          (body  (concat
                  "* %?" (and from (format " — from %s" (whatsapp-org--esc from))) "\n"
@@ -192,11 +216,13 @@ been decrypted on view (present in the plaintext cache)."
                  (if stamp (concat ":WHATSAPP_TS: " stamp "\n") "")
                  ":END:\n"
                  (if stamp (concat stamp "\n") "")
-                 "[[whatsapp:" (whatsapp-org--esc jid)
-                 "][WhatsApp: " (whatsapp-org--esc name) "]]\n"
+                 (whatsapp-org--esc
+                  (org-link-make-string (concat "whatsapp:" jid)
+                                        (format "WhatsApp: %s" name))) "\n"
                  (if (> (length text) 0)
-                     (concat "\n#+begin_quote\n" (whatsapp-org--esc text)
-                             "\n#+end_quote\n")
+                     (concat "\n#+begin_example\n"
+                             (whatsapp-org--esc (whatsapp-org--literal text))
+                             "\n#+end_example\n")
                    ""))))
     (list "w" "WhatsApp message" 'entry (list 'file file) body :empty-lines 1)))
 
@@ -223,8 +249,15 @@ been decrypted on view (present in the plaintext cache)."
 (defun whatsapp-org--export (string)
   "Export Org STRING to plain text using `whatsapp-org-export-backend'."
   (require 'ox-ascii)
-  (string-trim
-   (org-export-string-as string whatsapp-org-export-backend t '(:with-toc nil))))
+  ;; Sending text must not evaluate code or silently attach local files.  Keep
+  ;; macro expansion and INCLUDE expansion inert for this one export only.
+  (let ((org-export-use-babel nil)
+        (org-export-allow-bind-keywords nil))
+    (cl-letf (((symbol-function 'org-macro-replace-all) #'ignore)
+              ((symbol-function 'org-export-expand-include-keyword) #'ignore))
+      (string-trim
+       (org-export-string-as string whatsapp-org-export-backend t
+                             '(:with-toc nil))))))
 
 (defun whatsapp-org--subtree-body-string ()
   "Return the Org source of the current subtree, excluding its heading line."

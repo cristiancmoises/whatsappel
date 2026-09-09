@@ -3,11 +3,11 @@
 //
 //! Post-quantum message envelope for whatsappel.
 //!
-//! Suite 0x01: ML-KEM-1024 (FIPS 203) -> HKDF-SHA256 (RFC 5869, domain-separated)
+//! Suite 0x02: ML-KEM-1024 (FIPS 203) -> HKDF-SHA256 (RFC 5869, domain-separated)
 //! -> ChaCha20-Poly1305 (RFC 8439); ML-DSA-87 (FIPS 204) signature over the header.
 //!
-//! Primitives are libcrux (formally verified with hax/F*); this crate only
-//! composes them. It does NOT reimplement any primitive.
+//! Cryptographic primitives come from libcrux and RustCrypto; this crate
+//! composes them. Upstream proofs do not verify this protocol or its CLI.
 //!
 //! Scope: this protects message *content* between two parties who both run
 //! whatsappel and have exchanged public keys. To anyone else it is an opaque
@@ -178,6 +178,12 @@ impl<'a> Parser<'a> {
         self.i += n;
         Ok(s)
     }
+    pub(crate) fn finish(&self) -> Result<()> {
+        if self.i != self.b.len() {
+            return Err(boxed("unexpected trailing envelope bytes".into()));
+        }
+        Ok(())
+    }
     pub(crate) fn take_lv16(&mut self) -> Result<&'a [u8]> {
         let l = u16::from_be_bytes(fixed::<2>(self.take(2)?)?) as usize;
         self.take(l)
@@ -191,6 +197,9 @@ impl<'a> Parser<'a> {
 /// Seal `plaintext` to a recipient (their KEM public key), signed by the sender
 /// (their ML-DSA signing key). Returns the raw binary envelope (no transport tag).
 pub fn seal(recipient_kem_pk: &[u8], sender_sig_sk: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+    if plaintext.len() > u32::MAX as usize - 16 {
+        return Err(boxed("plaintext exceeds wire format length limit".into()));
+    }
     let pk = MlKem1024PublicKey::from(fixed::<KEM_PK>(recipient_kem_pk)?);
     if !mlkem1024::validate_public_key(&pk) {
         return Err(boxed("invalid recipient ML-KEM public key".into()));
@@ -259,6 +268,10 @@ pub fn open(my_kem_sk: &[u8], sender_sig_pk: &[u8], envelope: &[u8]) -> Result<O
     let aead_ct = p.take_lv32()?;
     let signed_len = p.pos(); // magic..aead_ct is the signed region
     let sig = p.take_lv16()?;
+    p.finish()?;
+    if meta.len() != META_LEN {
+        return Err(boxed("suite 0x02 requires freshness metadata".into()));
+    }
 
     // 1) authenticate the sender before touching anything else.
     let vk = MLDSA87VerificationKey::new(fixed::<SIG_PK>(sender_sig_pk)?);
@@ -405,5 +418,13 @@ mod tests {
         // Signature is valid (alice), but carol's KEM secret yields a different
         // shared secret, so the AEAD open must fail.
         assert!(open(&carol.kem_sk, &alice.sig_pk, &env).is_err());
+    }
+    #[test]
+    fn trailing_envelope_bytes_are_rejected() {
+        let bob = gen();
+        let alice = gen();
+        let mut env = seal(&bob.kem_pk, &alice.sig_sk, b"authentic").unwrap();
+        env.extend_from_slice(b"unauthenticated");
+        assert!(open(&bob.kem_sk, &alice.sig_pk, &env).is_err());
     }
 }

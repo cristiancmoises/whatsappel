@@ -1,7 +1,7 @@
 # systemd user unit for the whatsappel bridge.
 # Install: cp whatsappel.service ~/.config/systemd/user/
 #          systemctl --user daemon-reload && systemctl --user enable --now whatsappel
-# Requires an EnvironmentFile with WHATSAPPEL_TOKEN and WUZAPI_TOKEN.
+# Loads the existing shell-style .env with a restrictive process umask.
 [Unit]
 Description=whatsappel bridge (Emacs <-> wuzapi)
 After=network-online.target
@@ -10,8 +10,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/whatsappel
-EnvironmentFile=%h/whatsappel/.env
-ExecStart=/usr/bin/guile %h/whatsappel/whatsappel.scm
+ExecStart=/usr/bin/env bash -c 'set -e; set -a; . "$$HOME/whatsappel/.env"; set +a; exec guile "$$HOME/whatsappel/whatsappel.scm"'
+UMask=0077
 Restart=on-failure
 RestartSec=3
 # Hardening

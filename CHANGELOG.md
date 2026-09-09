@@ -3,6 +3,33 @@
 All notable changes to WhatsApp.el are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [3.1.0] — 2026-09-09 (upgrade candidate)
+
+### Added
+- Native dashboard actions, filtering, command palette and attachment picker.
+- Original-file document delivery and wider MIME recognition with safe document fallback.
+- Asynchronous refresh, bounded image prefetch/cache, and unchanged-history rendering guard.
+- Regression suites for Emacs, Guile, local HTTP integration, publication and PQ state.
+- Safe fish entry points for isolated patch application and four-host publication.
+- A working audit command, English/pt-BR usage, deployment and audit documentation.
+
+### Fixed
+- Token-bearing bridge logging, shell interpolation in LID lookup, malformed JSON handling,
+  duplicate/own-message unread counts, live history loss during sync and timestamp sorting.
+- JSON boolean handling, contact-key paths, attachment routing and cache growth in Emacs.
+- Optional PQ state concurrency, atomic private-file replacement, parser suffix acceptance,
+  replay-store error handling, and unsafe optional Org export/capture behavior.
+- Setup permissions and locked builds; systemd shell-style environment loading; Guix
+  wuzapi environment loading and explicit loopback bind.
+
+### Compatibility
+- Keep your existing `.env`, wuzapi session and PQ identity. New bridge tokens must be
+  URL-safe and at least 16 characters. Default upload size is 16 MiB; larger files
+  require matching client/bridge limits and a compatible wuzapi deployment.
+- Original images and unsupported native formats use document delivery. This release
+  does not introduce transcoding, a different WhatsApp protocol engine, or a browser UI.
+- See the audit for dependency updates, validation evidence and remaining limitations.
+
 ## [3.0.3] — 2026-06-17
 
 ### Added

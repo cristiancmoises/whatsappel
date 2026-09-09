@@ -2,6 +2,7 @@
 name = "pqenv"
 version = "0.3.0"
 edition = "2021"
+rust-version = "1.89"
 license = "AGPL-3.0-only"
 description = "Post-quantum message envelope + forward-secure ratchet (ML-KEM-1024 + ML-DSA-87 + ChaCha20-Poly1305) for whatsappel"
 
@@ -10,8 +11,8 @@ name = "pqenv"
 path = "src/main.rs"
 
 [dependencies]
-libcrux-ml-kem = "0.0.9"
-libcrux-ml-dsa = "0.0.9"
+libcrux-ml-kem = "0.0.10"
+libcrux-ml-dsa = "0.0.10"
 chacha20poly1305 = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"

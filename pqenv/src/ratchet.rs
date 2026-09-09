@@ -4,7 +4,7 @@
 //! Forward-secure session layer for whatsappel (`WAPQR` v1).
 //!
 //! Two parts:
-//!   1. An ephemeral-prekey bootstrap (PQXDH-style). The responder publishes a
+//!   1. A custom signed ephemeral-prekey bootstrap (not Signal PQXDH). The responder publishes a
 //!      one-time ML-KEM-1024 prekey signed by its long-term ML-DSA-87 identity.
 //!      The initiator verifies it, encapsulates, and signs the resulting init
 //!      token with *its* identity. The responder decapsulates with the ephemeral
@@ -252,8 +252,11 @@ impl Session {
             let n = u32::from_be_bytes(crate::fixed::<4>(p.take(4)?)?);
             let mut mk = Zeroizing::new([0u8; 32]);
             mk.copy_from_slice(p.take(32)?);
-            skipped.insert(n, mk);
+            if n >= recv_n || skipped.insert(n, mk).is_some() {
+                return Err(boxed("invalid or duplicate skipped message counter".into()));
+            }
         }
+        p.finish()?;
         Ok(Session {
             role,
             sid,
@@ -267,6 +270,13 @@ impl Session {
 
     /// Encrypt `plaintext` as the next outbound message, advancing the send chain.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let next_n = self
+            .send_n
+            .checked_add(1)
+            .ok_or_else(|| boxed("send counter overflow".into()))?;
+        if plaintext.len() > u32::MAX as usize - 16 {
+            return Err(boxed("plaintext exceeds wire format length limit".into()));
+        }
         let (nck, mk) = kdf_ck(&self.send_ck)?;
         let n = self.send_n;
         let dir = self.send_dir();
@@ -291,10 +301,7 @@ impl Session {
         put_lv32(&mut out, &ct);
         // Commit only after success.
         self.send_ck = nck;
-        self.send_n = self
-            .send_n
-            .checked_add(1)
-            .ok_or_else(|| boxed("send counter overflow".into()))?;
+        self.send_n = next_n;
         Ok(out)
     }
 
@@ -323,6 +330,8 @@ impl Session {
                 .map_err(|_| RecvError::Malformed)?,
         );
         let ct = p.take_lv32().map_err(|_| RecvError::Malformed)?;
+        p.finish().map_err(|_| RecvError::Malformed)?;
+        let next_n = n.checked_add(1).ok_or(RecvError::Malformed)?;
         let aad = msg_aad(&self.sid, dir, n);
 
         // Case 1: a previously skipped message.
@@ -354,7 +363,7 @@ impl Session {
         }
         self.prune_skipped();
         self.recv_ck = nck;
-        self.recv_n = n.checked_add(1).ok_or(RecvError::Malformed)?;
+        self.recv_n = next_n;
         Ok(pt)
     }
 
@@ -440,6 +449,7 @@ fn parse_prekey_public(blob: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     }
     let kem_pk = p.take_lv16()?.to_vec();
     let sig = p.take_lv16()?.to_vec();
+    p.finish()?;
     Ok((kem_pk, sig))
 }
 
@@ -448,7 +458,9 @@ fn parse_prekey_secret(blob: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     if p.take(6)? != PREKEY_MAGIC || p.take(1)?[0] != 0x00 {
         return Err(boxed("not a WAPQR prekey secret".into()));
     }
-    Ok(Zeroizing::new(p.take_lv16()?.to_vec()))
+    let secret = Zeroizing::new(p.take_lv16()?.to_vec());
+    p.finish()?;
+    Ok(secret)
 }
 
 /// Initiator side. Verify the responder's prekey (signed by `peer_sig_pk`),
@@ -510,6 +522,7 @@ pub fn accept(
     let sid = crate::fixed::<16>(p.take(16)?)?;
     let ct_bytes = p.take_lv16()?.to_vec();
     let sig = p.take_lv16()?.to_vec();
+    p.finish()?;
 
     let mut signed_init = Vec::with_capacity(6 + 16 + ct_bytes.len());
     signed_init.extend_from_slice(INIT_MAGIC);
@@ -729,5 +742,72 @@ mod rtests {
         let (_a2, m1) = send(&reser, b"b");
         let (_b2, r1) = recv(&b1, &m1);
         assert_eq!(r1.unwrap(), b"b");
+    }
+    #[test]
+    fn trailing_bytes_rejected_in_all_ratchet_formats() {
+        let alice = keygen().unwrap();
+        let bob = keygen().unwrap();
+        let (pubb, secb) = gen_prekey(&bob.sig_sk).unwrap();
+        let (a, token) = init(&alice.sig_sk, &bob.sig_pk, &pubb).unwrap();
+        let b = accept(&alice.sig_pk, &secb, &token).unwrap();
+        let mut bad = pubb.clone();
+        bad.push(0);
+        assert!(init(&alice.sig_sk, &bob.sig_pk, &bad).is_err());
+        let mut bad = secb.to_vec();
+        bad.push(0);
+        assert!(accept(&alice.sig_pk, &bad, &token).is_err());
+        let mut bad = token.clone();
+        bad.push(0);
+        assert!(accept(&alice.sig_pk, &secb, &bad).is_err());
+        let mut bad = a.to_vec();
+        bad.push(0);
+        assert!(Session::from_bytes(&bad).is_err());
+        let (_, mut msg) = send(&a, b"authentic");
+        msg.push(0);
+        let (after, result) = recv(&b, &msg);
+        assert_eq!(result.unwrap_err(), RecvError::Malformed);
+        assert_eq!(&*after, &*b);
+    }
+
+    #[test]
+    fn counters_fail_before_mutating_chain_keys() {
+        let mut sender = Session::from_seed(&[7u8; 32], [9u8; 16], ROLE_INITIATOR).unwrap();
+        sender.send_n = u32::MAX;
+        let before = sender.to_bytes();
+        assert!(sender.encrypt(b"limit").is_err());
+        assert_eq!(&*before, &*sender.to_bytes());
+        let mut receiver = Session::from_seed(&[7u8; 32], [9u8; 16], ROLE_RESPONDER).unwrap();
+        receiver.recv_n = u32::MAX;
+        let before = receiver.to_bytes();
+        let (_, mk) = kdf_ck(&sender.send_ck).unwrap();
+        let (key, nonce) = msg_key_nonce(&mk).unwrap();
+        let aad = msg_aad(&sender.sid, sender.send_dir(), u32::MAX);
+        let ct = ChaCha20Poly1305::new(Key::from_slice(&*key))
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: b"limit",
+                    aad: &aad,
+                },
+            )
+            .unwrap();
+        let mut msg = aad;
+        put_lv32(&mut msg, &ct);
+        assert_eq!(receiver.decrypt(&msg).unwrap_err(), RecvError::Malformed);
+        assert_eq!(&*before, &*receiver.to_bytes());
+    }
+
+    #[test]
+    fn malformed_skipped_counters_are_rejected() {
+        let (_, b) = pair();
+        let mut s = Session::from_bytes(&b).unwrap();
+        s.skipped.insert(0, Zeroizing::new([1u8; 32]));
+        assert!(Session::from_bytes(&s.to_bytes()).is_err());
+        s.recv_n = 1;
+        let mut bytes = s.to_bytes().to_vec();
+        // count lives at byte 96; duplicate the only 36-byte skipped entry.
+        bytes[96..100].copy_from_slice(&2u32.to_be_bytes());
+        bytes.extend_from_within(100..136);
+        assert!(Session::from_bytes(&bytes).is_err());
     }
 }

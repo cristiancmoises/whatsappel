@@ -20,6 +20,9 @@
 ;;;   WHATSAPPEL_PUBLIC_URL  URL wuzapi calls back  (default http://HOST:PORT)
 ;;;   WHATSAPPEL_SUBSCRIBE   wuzapi events          (default Message)
 ;;;   WHATSAPPEL_CHAT_CAP    msgs kept per chat     (default 500)
+;;;   WHATSAPPEL_MAX_CHATS   total retained chats   (default 1000)
+;;;   WHATSAPPEL_MAX_BODY_BYTES buffered body/response cap (default 24 MiB)
+;;;   WHATSAPPEL_MAX_MEDIA_BYTES decoded media cap  (default 16 MiB)
 ;;;   WUZAPI_BASE_URL        wuzapi base            (default http://127.0.0.1:8080)
 ;;;   WUZAPI_TOKEN           REQUIRED wuzapi user token
 ;;;   WUZAPI_TOKEN_HEADER    header name for above  (default Token)
@@ -34,6 +37,9 @@
              (ice-9 threads)
              (ice-9 popen)
              (ice-9 rdelim)
+             (ice-9 binary-ports)
+             (ice-9 regex)
+             (ice-9 match)
              (rnrs bytevectors)
              (srfi srfi-1)
              (srfi srfi-13))
@@ -45,22 +51,39 @@
 (define (env name default) (or (getenv name) default))
 
 (define (require-env name)
-  (or (getenv name)
+  (or (let ((value (getenv name)))
+        (and value (> (string-length value) 0) value))
       (begin
         (format (current-error-port)
                 "whatsappel: missing required environment variable ~a~%" name)
         (exit 2))))
 
+(define (env-integer name default minimum maximum)
+  (let ((n (string->number (env name default))))
+    (unless (and (integer? n) (exact? n) (<= minimum n maximum))
+      (error "invalid numeric configuration" name))
+    n))
+
 (define *host*          (env "WHATSAPPEL_HOST" "127.0.0.1"))
-(define *port*          (string->number (env "WHATSAPPEL_PORT" "7337")))
+(define *port*          (env-integer "WHATSAPPEL_PORT" "7337" 1 65535))
 (define *bridge-token*  (require-env "WHATSAPPEL_TOKEN"))
 (define *wuzapi-base*   (env "WUZAPI_BASE_URL" "http://127.0.0.1:8080"))
 (define *wuzapi-token*  (require-env "WUZAPI_TOKEN"))
 (define *wuzapi-hdr*    (string->symbol (string-downcase (env "WUZAPI_TOKEN_HEADER" "Token"))))
 (define *subscribe*     (env "WHATSAPPEL_SUBSCRIBE" "Message"))
-(define *chat-cap*      (string->number (env "WHATSAPPEL_CHAT_CAP" "500")))
+(define *chat-cap*      (env-integer "WHATSAPPEL_CHAT_CAP" "500" 1 10000))
 (define *public-url*    (env "WHATSAPPEL_PUBLIC_URL"
                              (format #f "http://~a:~a" *host* *port*)))
+(define *max-body-bytes* (env-integer "WHATSAPPEL_MAX_BODY_BYTES" "25165824" 1024 268435456))
+(define *max-media-bytes* (env-integer "WHATSAPPEL_MAX_MEDIA_BYTES" "16777216" 1 201326592))
+(define *max-chats* (env-integer "WHATSAPPEL_MAX_CHATS" "1000" 1 100000))
+(define *max-text-length* 65536)
+
+;; The webhook token is a path segment; reject characters that alter the URL.
+(unless (and (string-match "^[A-Za-z0-9_-]+$" *bridge-token*)
+             (>= (string-length *bridge-token*) 16))
+  (error "WHATSAPPEL_TOKEN must contain at least 16 URL-safe letters, digits, - or _"))
+
 (define *hook-path*     (string-append "/hook/" *bridge-token*))
 (define *hook-url*      (string-append *public-url* *hook-path*))
 
@@ -95,36 +118,50 @@
                        (cache-control . (no-store))))
           (string->utf8 (scm->json-string obj))))
 
+(define (json-object? x)
+  (and (list? x) (every (lambda (entry) (and (pair? entry) (string? (car entry)))) x)))
+
 (define (safe-json-parse s)
-  (catch #t (lambda () (json-string->scm s)) (lambda _ #f)))
+  (catch #t
+    (lambda ()
+      (let ((obj (json-string->scm s)))
+        (and (json-object? obj) obj)))
+    (lambda _ #f)))
+
+(define (nonempty-string? s)
+  (and (string? s) (> (string-length (string-trim-both s)) 0)))
+
+(define (char-iso-control? c)
+  (let ((n (char->integer c))) (or (< n 32) (<= 127 n 159))))
+
+(define (valid-target? s)
+  (and (nonempty-string? s) (<= (string-length s) 256)
+       (not (string-any char-whitespace? s))
+       (not (string-any char-iso-control? s))))
+
+(define (optional-string? value maximum)
+  (or (not value) (and (string? value) (<= (string-length value) maximum))))
+
+(define (upstream-ok? status parsed)
+  (and (<= 200 status 299)
+       (or (= status 204) (json-object? parsed))
+       (or (not (json-object? parsed))
+           (not (assoc "success" parsed))
+           (not (eq? #f (assoc-ref parsed "success"))))))
 
 ;; First present key from an alist (string keys); tries each variant.
 (define (jget obj . keys)
-  (and (pair? obj)
+  (and (json-object? obj)
        (let loop ((ks keys))
          (and (pair? ks)
               (or (assoc-ref obj (car ks)) (loop (cdr ks)))))))
 
 ;; Minimal x-www-form-urlencoded decoding (fallback webhook payloads + queries).
-(define (hexval c)
-  (cond ((char<=? #\0 c #\9) (- (char->integer c) 48))
-        ((char<=? #\a c #\f) (+ 10 (- (char->integer c) 97)))
-        ((char<=? #\A c #\F) (+ 10 (- (char->integer c) 65)))
-        (else 0)))
-
 (define (url-decode s)
-  (let ((out (open-output-string)) (n (string-length s)))
-    (let loop ((i 0))
-      (if (>= i n)
-          (get-output-string out)
-          (let ((c (string-ref s i)))
-            (cond ((char=? c #\+) (write-char #\space out) (loop (1+ i)))
-                  ((and (char=? c #\%) (< (+ i 2) n))
-                   (write-char (integer->char (+ (* 16 (hexval (string-ref s (1+ i))))
-                                                 (hexval (string-ref s (+ i 2)))))
-                               out)
-                   (loop (+ i 3)))
-                  (else (write-char c out) (loop (1+ i)))))))))
+  ;; Decode percent escapes as UTF-8 bytes, preserving non-ASCII names correctly.
+  (catch #t
+    (lambda () (uri-decode (string-map (lambda (c) (if (char=? c #\+) #\space c)) s)))
+    (lambda _ #f)))
 
 (define (form-param body key)
   (and (string? body)
@@ -142,7 +179,7 @@
 ;; Unify chat keys: bare number for 1:1, full jid for groups.
 (define (normalize-jid s)
   (cond ((not (string? s)) "unknown")
-        ((string-contains s "@g.us") s)
+        ((or (string-suffix? "@g.us" s) (string-suffix? "@lid" s)) s)
         ((string-index s #\@) => (lambda (i) (substring s 0 i)))
         (else s)))
 
@@ -156,7 +193,7 @@
 ;;; ---------------------------------------------------------------------------
 
 ;; Returns (values status parsed-or-#f raw-string).
-(define (wuzapi-request method path body-obj)
+(define (wuzapi-request/raw method path body-obj)
   (let* ((uri  (string-append *wuzapi-base* path))
          (body (and body-obj (string->utf8 (scm->json-string body-obj))))
          (hdrs (append
@@ -166,22 +203,39 @@
                     '()))))
     (call-with-values
         (lambda ()
-          (http-request uri
-                        #:method method
-                        #:headers hdrs
-                        #:body body
-                        #:decode-body? #f
-                        #:streaming? #f))
+          ;; Guile ignores no_proxy; never send local credentials to env proxies.
+          (let* ((host (uri-host (string->uri uri)))
+                 (local? (member host '("127.0.0.1" "localhost" "::1"))))
+            (parameterize ((current-http-proxy (if local? #f (current-http-proxy)))
+                           (current-https-proxy (if local? #f (current-https-proxy))))
+              (http-request uri
+                            #:method method #:headers hdrs #:body body
+                            #:decode-body? #f #:streaming? #t))))
       (lambda (resp rbody)
         (let* ((status (response-code resp))
-               (text   (body->string rbody))
-               (parsed (and (> (string-length text) 0) (safe-json-parse text))))
+               (text (dynamic-wind
+                       (lambda () #t)
+                       (lambda ()
+                         (let ((bytes (get-bytevector-n rbody (1+ *max-body-bytes*))))
+                           (when (and (bytevector? bytes)
+                                      (> (bytevector-length bytes) *max-body-bytes*))
+                             (error "upstream response exceeds configured limit"))
+                           (if (eof-object? bytes) "" (body->string bytes))))
+                       (lambda () (close-port rbody))))
+               (parsed (and (> (string-length text) 0)
+                            (catch #t (lambda () (json-string->scm text)) (lambda _ #f)))))
           (values status parsed text))))))
+
+(define (wuzapi-request method path body-obj)
+  (catch #t
+    (lambda () (wuzapi-request/raw method path body-obj))
+    ;; Never log exceptions here: URLs/headers may contain credentials.
+    (lambda _ (values 502 '(("error" . "upstream unavailable or response exceeds limit")) ""))))
 
 (define (relay method path body-obj)
   (call-with-values (lambda () (wuzapi-request method path body-obj))
     (lambda (status parsed text)
-      (json-response (if (and (>= status 200) (< status 300)) 200 502)
+      (json-response (if (upstream-ok? status parsed) 200 502)
                      (list (cons "wuzapi_status" status)
                            (cons "data" (or parsed text)))))))
 
@@ -194,20 +248,86 @@
 (define *names*  (make-hash-table))   ; jid -> push name
 (define *smutex* (make-mutex))
 
-(define (store-inbound! rec)
-  (with-mutex *smutex*
-    (let* ((chat (normalize-jid (or (assoc-ref rec "chat")
-                                    (assoc-ref rec "from") "unknown")))
-           (cur  (hash-ref *chats* chat '())))
-      (hash-set! *chats* chat (take-last (append cur (list rec)) *chat-cap*))
-      (hash-set! *unread* chat (1+ (hash-ref *unread* chat 0)))
-      (let ((nm (assoc-ref rec "name"))) (when nm (hash-set! *names* chat nm))))))
+(define (record-id rec) (let ((id (jget rec "id"))) (and (nonempty-string? id) id)))
 
-(define (store-outbound! chat rec)
+(define (valid-epoch? value)
+  (and (real? value) (finite? value) (<= 0 value 253402300799)))
+
+(define (parse-timestamp ts)
+  (cond ((valid-epoch? ts) ts)
+        ((not (string? ts)) #f)
+        ((let ((n (string->number ts))) (and (valid-epoch? n) n)) => identity)
+        ((string-match "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})$" ts)
+         => (lambda (match)
+              (catch #t
+                (lambda ()
+                  (let* ((plain (string-append (substring ts 0 19) (match:substring match 2)))
+                         (tm (car (strptime "%Y-%m-%dT%H:%M:%S%z" plain)))
+                         (offset (vector-ref tm 9))
+                         (epoch (+ offset (car (mktime tm "UTC")))))
+                    (and (valid-epoch? epoch) epoch)))
+                (lambda _ #f))))
+        (else #f)))
+
+(define (timestamp-value rec) (or (parse-timestamp (jget rec "ts")) 0))
+
+(define (record-before? a b)
+  (let ((ta (timestamp-value a)) (tb (timestamp-value b)))
+    (if (= ta tb) (string<? (or (record-id a) "") (or (record-id b) "")) (< ta tb))))
+
+(define (trim-chats! incoming)
+  ;; Evict the least recently active chat as one unit, including auxiliary maps.
+  (when (and (not (hash-ref *chats* incoming #f))
+             (>= (hash-count (const #t) *chats*) *max-chats*))
+    (let ((oldest #f) (oldtime +inf.0))
+      (hash-for-each
+       (lambda (chat records)
+         (let ((ts (if (null? records) 0 (timestamp-value (last records)))))
+           (when (or (not oldest) (< ts oldtime)
+                     (and (= ts oldtime) (string<? chat oldest)))
+             (set! oldest chat) (set! oldtime ts)))) *chats*)
+      (when oldest
+        (for-each (lambda (table) (hash-remove! table oldest))
+                  (list *chats* *unread* *names* *rawjid*))))))
+
+(define (merge-records current incoming)
+  ;; History never replaces live messages; a refresh may enrich an existing ID.
+  (let ((seen (make-hash-table)) (anonymous '()))
+    (for-each (lambda (rec)
+                (let ((id (record-id rec)))
+                  (if id
+                      (let ((old (hash-ref seen id '())))
+                        (hash-set! seen id (append rec (filter
+                          (lambda (entry) (not (assoc (car entry) rec))) old))))
+                      (set! anonymous (cons rec anonymous)))))
+              (append current incoming))
+    (take-last (sort (hash-fold (lambda (id rec out) (cons rec out)) anonymous seen)
+                     record-before?) *chat-cap*)))
+
+(define (store-record! chat rec inbound?)
   (with-mutex *smutex*
     (let* ((key (normalize-jid chat))
-           (cur (hash-ref *chats* key '())))
-      (hash-set! *chats* key (take-last (append cur (list rec)) *chat-cap*)))))
+           (cur (hash-ref *chats* key '()))
+           (id (record-id rec))
+           (duplicate? (and id (any (lambda (r) (equal? id (record-id r))) cur))))
+      (trim-chats! key)
+      (hash-set! *rawjid* key chat)
+      (hash-set! *chats* key
+        (if (and (not duplicate?)
+                 (or (null? cur) (not (record-before? rec (last cur)))))
+            (take-last (append cur (list rec)) *chat-cap*)
+            (merge-records cur (list rec))))
+      (when (and inbound? (not duplicate?) (not (jget rec "me")))
+        (hash-set! *unread* key (min *chat-cap* (1+ (hash-ref *unread* key 0)))))
+      (let ((nm (jget rec "name")))
+        (when (and (nonempty-string? nm) (not (jget rec "me")))
+          (hash-set! *names* key nm)))
+      (not duplicate?))))
+
+(define (store-inbound! rec)
+  (store-record! (or (jget rec "chat" "from") "unknown") rec #t))
+
+(define (store-outbound! chat rec) (store-record! chat rec #f))
 
 ;; Detect a media sub-message. Returns (values kind-string media-alist caption).
 (define (detect-media msg)
@@ -218,15 +338,23 @@
                       ("stickerMessage" . "sticker") ("StickerMessage" . "sticker"))))
     (if (null? specs)
         (values #f #f #f)
-        (let ((mm (assoc-ref msg (caar specs))))
-          (if (pair? mm)
+        (let ((mm (jget msg (caar specs))))
+          (if (and (json-object? mm) (pair? mm))
               (values (cdar specs) mm
                       (or (assoc-ref mm "caption") (assoc-ref mm "Caption")))
               (loop (cdr specs)))))))
 
 ;; Extract wuzapi download fields from a media sub-message (defensive casing).
 (define (media-dl-fields mm)
-  (filter-false
+  (filter
+   (lambda (entry)
+     (let ((value (cdr entry)))
+       (if (string=? (car entry) "FileLength")
+           (let ((n (if (string? value) (string->number value) value)))
+             (and (integer? n) (exact? n) (<= 0 n 201326592)))
+           (and (string? value)
+                (<= (string-length value)
+                    (if (member (car entry) '("Url" "DirectPath")) 8192 256))))))
    (list (cons "Url"           (jget mm "url" "URL" "Url"))
          (cons "DirectPath"    (jget mm "directPath" "DirectPath" "direct_path"))
          (cons "MediaKey"      (jget mm "mediaKey" "MediaKey"))
@@ -253,16 +381,16 @@
                    (else #f))))))
 
 ;; Parse a webhook payload (JSON or form jsonData) into a message record.
-;; Always preserves the raw body.
+;; Keep parsed fields only; duplicating raw/base64 webhook data wastes memory.
 (define (extract-message raw)
   (let ((o (or (safe-json-parse raw)
                (let ((jd (form-param raw "jsonData")))
                  (and jd (safe-json-parse jd))))))
     (if (not (pair? o))
-        (list (cons "raw" raw))
+        #f
         (let* ((ev     (assoc-ref o "event"))
-               (info   (and (pair? ev) (assoc-ref ev "Info")))
-               (msg    (and (pair? ev) (assoc-ref ev "Message")))
+               (info   (and (json-object? ev) (jget ev "Info" "info")))
+               (msg    (and (json-object? ev) (jget ev "Message" "message")))
                (sender (and (pair? info) (or (assoc-ref info "Sender")
                                              (assoc-ref info "Chat"))))
                (chat   (and (pair? info) (or (assoc-ref info "Chat")
@@ -279,16 +407,16 @@
               (filter-false
                (list (cons "type" (assoc-ref o "type"))
                      (cons "from" sender)
+                     (cons "me" (eq? #t (jget info "IsFromMe")))
                      (cons "chat" chat)
                      (cons "name" name)
                      (cons "id"   id)
-                     (cons "ts"   ts)
+                     (cons "ts"   (or ts (current-ts)))
                      (cons "text" text)
                      (cons "kind" (or kind (and (pq-text? text) "pq")))
                      (cons "caption" cap)
                      (cons "reply" (msg-quoted-text msg))
-                     (cons "media" (and mm (media-dl-fields mm)))
-                     (cons "raw"  raw)))))))))
+                     (cons "media" (and mm (media-dl-fields mm)))))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; History import from wuzapi (existing chats on first link / restart)
@@ -303,7 +431,7 @@
 ;;; resolved from /user/contacts and /group/list.
 ;;; ---------------------------------------------------------------------------
 
-(define *history-limit* (string->number (env "WHATSAPPEL_HISTORY" "200")))
+(define *history-limit* (env-integer "WHATSAPPEL_HISTORY" "200" 1 10000))
 (define *syncing?* #f)
 
 ;; Optional: wuzapi's whatsmeow store (main.db). When set, we read its
@@ -323,10 +451,10 @@
                (file-exists? *lidmap-db*))
       (catch #t
         (lambda ()
-          (let* ((q   "SELECT lid, pn FROM whatsmeow_lid_map;")
-                 (cmd (string-append "sqlite3 -readonly -noheader -separator '|' '"
-                                     *lidmap-db* "' \"" q "\" 2>/dev/null"))
-                 (port (open-input-pipe cmd)))
+          (let* ((q "SELECT lid, pn FROM whatsmeow_lid_map;")
+                 ;; No shell: database paths may contain quotes and metacharacters.
+                 (port (open-pipe* OPEN_READ "sqlite3" "-readonly" "-noheader"
+                                   "-separator" "|" *lidmap-db* q)))
             (let loop ()
               (let ((line (read-line port)))
                 (unless (eof-object? line)
@@ -336,18 +464,12 @@
                   (loop))))
             (close-pipe port)))
         (lambda (k . a)
-          (format #t "whatsappel: lid-map load failed: ~a ~a~%" k a))))
+          (format #t "whatsappel: lid-map load failed: ~a~%" k))))
     (format #t "whatsappel: lid-map entries: ~a~%" (hash-count (const #t) h))
     h))
 
 ;; Percent-encode a chat jid for use in a query string ("@" -> "%40", etc.).
-(define (uri-encode s)
-  (string-concatenate
-   (map (lambda (c)
-          (if (or (char-alphabetic? c) (char-numeric? c) (memv c '(#\- #\_ #\.)))
-              (string c)
-              (format #f "%~2,'0X" (char->integer c))))
-        (string->list s))))
+(define (uri-encode s) ((@ (web uri) uri-encode) s))
 
 ;; Resolve display names from contacts (1:1) and group subjects.
 (define (load-names!)
@@ -421,17 +543,19 @@
         (wuzapi-request 'GET (string-append "/chat/history?chat_jid=" (uri-encode jid)
                                             "&limit=" (number->string *history-limit*)) #f))
     (lambda (st parsed raw)
+      (unless (upstream-ok? st parsed) (throw 'upstream-failure))
       (let* ((rows (->list (and (pair? parsed) (assoc-ref parsed "data"))))
-             (recs (map history-row->rec rows))
-             (good (filter (lambda (r) (assoc-ref r "ts")) recs))
-             (sorted (sort good (lambda (a b)
-                                  (string<? (or (assoc-ref a "ts") "")
-                                            (or (assoc-ref b "ts") ""))))))
+             (recs (map history-row->rec (filter json-object? rows)))
+             (good (filter (lambda (r) (and (parse-timestamp (jget r "ts"))
+                                          (valid-target? (jget r "id"))
+                                          (optional-string? (jget r "text") *max-text-length*))) recs))
+             (sorted (sort good record-before?)))
         (when (pair? sorted)
           (with-mutex *smutex*
             (let ((key (normalize-jid jid)))
+              (trim-chats! key)
               (hash-set! *rawjid* key jid)
-              (hash-set! *chats* key (take-last sorted *chat-cap*))
+              (hash-set! *chats* key (merge-records (hash-ref *chats* key '()) sorted))
               (unless (hash-ref *unread* key #f) (hash-set! *unread* key 0))
               ;; If contacts/groups didn't name this chat, fall back to the
               ;; PushName carried by its most recent inbound (non-me) message.
@@ -447,7 +571,7 @@
               ;; which is far more useful than the opaque lid.
               (when (and (not (hash-ref *names* key #f))
                          (string-contains jid "@lid"))
-                (let ((phone (hash-ref *lidmap* key #f)))
+                (let ((phone (hash-ref *lidmap* (car (string-split key #\@)) #f)))
                   (when (string? phone)
                     (hash-set! *names* key
                                (or (hash-ref *names* phone #f)
@@ -455,10 +579,10 @@
 
 ;; Pull every chat's history from wuzapi into the store. Safe to call repeatedly.
 (define (sync-history!)
-  (if *syncing?*
+  (if (not (with-mutex *smutex*
+             (and (not *syncing?*) (begin (set! *syncing?* #t) #t))))
       0
       (begin
-        (set! *syncing?* #t)
         (let ((n 0))
           (catch #t
             (lambda ()
@@ -467,6 +591,7 @@
               (call-with-values
                   (lambda () (wuzapi-request 'GET "/chat/history?chat_jid=index" #f))
                 (lambda (st parsed raw)
+                  (unless (upstream-ok? st parsed) (throw 'upstream-failure))
                   (let ((data (and (pair? parsed) (assoc-ref parsed "data"))))
                     (when (pair? data)
                       (for-each
@@ -478,8 +603,9 @@
                           (->list (cdr uentry))))
                        data))))))
             (lambda (key . args)
-              (format #t "whatsappel: history sync error: ~a ~a~%" key args)))
-          (set! *syncing?* #f)
+              (set! n #f)
+              (format #t "whatsappel: history sync error: ~a~%" key)))
+          (with-mutex *smutex* (set! *syncing?* #f))
           (format #t "whatsappel: history sync imported ~a chat(s)~%" n)
           n))))
 
@@ -499,15 +625,15 @@
             (lambda () (wuzapi-request 'POST "/webhook"
                                        (list (cons "webhookURL" *hook-url*))))
           (lambda (wstatus wparsed wtext)
-            (json-response 200
+            (json-response (if (and (upstream-ok? cstatus cparsed)
+                                                 (upstream-ok? wstatus wparsed)) 200 502)
                            (list (cons "connect_status" cstatus)
                                  (cons "connect" (or cparsed ctext))
                                  (cons "webhook_registered"
-                                       (and (>= wstatus 200) (< wstatus 300)))
-                                 (cons "hook_url" *hook-url*)))))))))
+                                       (upstream-ok? wstatus wparsed))))))))))
 
 (define (respond-send status parsed text)
-  (json-response (if (and (>= status 200) (< status 300)) 200 502)
+  (json-response (if (upstream-ok? status parsed) 200 502)
                  (list (cons "wuzapi_status" status) (cons "data" (or parsed text)))))
 
 (define (handle-send body-str)
@@ -522,8 +648,10 @@
          (ctx   (and (string? rid) (string? rpart)
                      (> (string-length rid) 0) (> (string-length rpart) 0)
                      (list (cons "StanzaID" rid) (cons "Participant" rpart)))))
-    (if (or (not (string? to)) (not (string? text))
-            (= 0 (string-length to)) (= 0 (string-length text)))
+    (if (or (not (valid-target? to)) (not (nonempty-string? text))
+            (and (string? text) (> (string-length text) *max-text-length*))
+            (not (optional-string? rid 256)) (not (optional-string? rpart 256))
+            (not (optional-string? rtext *max-text-length*)))
         (json-response 400 '(("error" . "missing 'to' or 'body'")))
         (call-with-values
             (lambda () (wuzapi-request 'POST "/chat/send/text"
@@ -533,77 +661,141 @@
                                                          (cons "QuotedText" (or rtext "")))
                                                    '()))))
           (lambda (status parsed raw)
-            (when (and (>= status 200) (< status 300))
+            (when (upstream-ok? status parsed)
               (store-outbound! to (filter-false
                                    (list (cons "from" "me") (cons "me" #t)
                                          (cons "text" text)
+                                         (cons "id" (jget (jget parsed "data") "Id" "ID" "id"))
                                          (cons "kind" (and (pq-text? text) "pq"))
                                          (cons "reply" (and ctx (or rtext "")))
                                          (cons "ts" (current-ts))))))
             (respond-send status parsed raw))))))
 
-;; kind: image | video | gif | audio | document | sticker
+;; /send/gif remains an MP4 video alias. Stock wuzapi has no GIF-loop flag.
+(define *media-specs*
+  '(("image" "/chat/send/image" "Image" "/chat/downloadimage" "image/")
+    ("video" "/chat/send/video" "Video" "/chat/downloadvideo" "video/")
+    ("gif" "/chat/send/video" "Video" "/chat/downloadvideo" "video/mp4")
+    ("audio" "/chat/send/audio" "Audio" "/chat/downloadaudio" "audio/")
+    ("document" "/chat/send/document" "Document" "/chat/downloaddocument" "")
+    ("sticker" "/chat/send/sticker" "Sticker" "/chat/downloadsticker" "image/webp")))
+
+(define (base64-index c)
+  (string-index "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" c))
+
+(define (data-uri-info data)
+  ;; Validate in one pass without allocating a decoded copy of large media.
+  ;; Return (mime decoded-size), or #f for URLs, malformed/empty base64, etc.
+  (and (string? data) (string-prefix? "data:" data)
+       (let ((comma (string-index data #\,)))
+         (and comma (< comma 160)
+              (let ((header (substring data 5 comma))
+                    (size (- (string-length data) comma 1)))
+                (and (string-suffix? ";base64" header)
+                     (> size 0) (zero? (modulo size 4))
+                     (let* ((mime (substring header 0 (- (string-length header) 7)))
+                            (end (string-length data))
+                            (padding (cond ((and (> size 1)
+                                                 (string-suffix? "==" data)) 2)
+                                           ((string-suffix? "=" data) 1) (else 0)))
+                            (decoded (- (* 3 (quotient size 4)) padding)))
+                       (and (string-match "^[a-zA-Z0-9!#$&^_.+-]+/[a-zA-Z0-9!#$&^_.+-]+$" mime)
+                            (<= decoded *max-media-bytes*)
+                            (let loop ((i (1+ comma)))
+                              (cond ((>= i (- end padding)) #t)
+                                    ((base64-index (string-ref data i)) (loop (1+ i)))
+                                    (else #f)))
+                            ;; Reject noncanonical padding bits, too.
+                            (or (zero? padding)
+                                (zero? (modulo (base64-index
+                                   (string-ref data (- end padding 1)))
+                                   (if (= padding 2) 16 4))))
+                            (list (string-downcase mime) decoded)))))))))
+
+(define (valid-filename? filename)
+  (and (nonempty-string? filename) (<= (string-length filename) 255)
+       (not (member filename '("." "..")))
+       (not (string-any (lambda (c) (or (memv c '(#\/ #\\))
+                                        (char-iso-control? c))) filename))))
+
 (define (handle-send-media kind body-str)
-  (let* ((o        (safe-json-parse body-str))
-         (to       (and (pair? o) (assoc-ref o "to")))
-         (data     (and (pair? o) (assoc-ref o "data")))
-         (caption  (and (pair? o) (assoc-ref o "caption")))
-         (filename (and (pair? o) (assoc-ref o "filename"))))
-    (if (or (not (string? to)) (not (string? data)))
-        (json-response 400 '(("error" . "missing 'to' or 'data'")))
-        (let ((wpath (cond ((string=? kind "image")    "/chat/send/image")
-                           ((string=? kind "video")    "/chat/send/video")
-                           ((string=? kind "gif")      "/chat/send/video")
-                           ((string=? kind "audio")    "/chat/send/audio")
-                           ((string=? kind "document") "/chat/send/document")
-                           ((string=? kind "sticker")  "/chat/send/sticker")
-                           (else #f)))
-              (field (cond ((string=? kind "image")    "Image")
-                           ((string=? kind "video")    "Video")
-                           ((string=? kind "gif")      "Video")
-                           ((string=? kind "audio")    "Audio")
-                           ((string=? kind "document") "Document")
-                           ((string=? kind "sticker")  "Sticker")
-                           (else #f))))
-          (if (not wpath)
-              (json-response 400 '(("error" . "unknown media kind")))
-              (call-with-values
-                  (lambda () (wuzapi-request 'POST wpath
-                                             (filter-false
-                                              (list (cons "Phone" to)
-                                                    (cons field data)
-                                                    (cons "Caption" caption)
-                                                    (cons "FileName" filename)))))
-                (lambda (status parsed raw)
-                  (when (and (>= status 200) (< status 300))
-                    (store-outbound! to (filter-false
-                                         (list (cons "from" "me") (cons "me" #t)
-                                               (cons "kind" kind)
-                                               (cons "caption" caption)
-                                               (cons "text" (and caption caption))
-                                               (cons "ts" (current-ts))))))
-                  (respond-send status parsed raw))))))))
+  (let* ((o (safe-json-parse body-str))
+         (spec (assoc kind *media-specs*))
+         (to (jget o "to")) (data (jget o "data"))
+         (caption (jget o "caption")) (filename (jget o "filename"))
+         (info (data-uri-info data)))
+    (cond
+     ((or (not spec) (not (valid-target? to))
+          (not (optional-string? caption *max-text-length*))
+          (and filename (not (valid-filename? filename)))
+          (and (equal? kind "document") (not (valid-filename? filename))))
+      (json-response 400 '(("error" . "invalid recipient, caption or filename"))))
+     ((not info)
+      (json-response 400 '(("error" . "media must be a nonempty base64 data URI within the media size limit"))))
+     ((not (string-prefix? (list-ref spec 4) (car info)))
+      (json-response 400 '(("error" . "media MIME does not match kind; send original files as documents (GIF mode requires MP4)"))))
+     (else
+      (call-with-values
+          (lambda () (wuzapi-request 'POST (list-ref spec 1)
+             (filter-false (list (cons "Phone" to) (cons (list-ref spec 2) data)
+                                 (cons "Caption" caption) (cons "FileName" filename)
+                                 (cons "MimeType" (car info))))))
+        (lambda (status parsed raw)
+          (when (upstream-ok? status parsed)
+            (store-outbound! to (filter-false
+              (list (cons "from" "me") (cons "me" #t) (cons "kind" kind)
+                    (cons "id" (jget (jget parsed "data") "Id" "ID" "id"))
+                    (cons "caption" caption) (cons "text" caption)
+                    (cons "filename" filename) (cons "mimetype" (car info))
+                    (cons "ts" (current-ts))))))
+          (respond-send status parsed raw)))))))
+
+(define (valid-download-url? value)
+  ;; The bridge only forwards WhatsApp's media metadata, never arbitrary URLs.
+  (and (nonempty-string? value) (<= (string-length value) 8192)
+       (catch #t
+         (lambda ()
+           (let* ((uri (string->uri value))
+                  (host (and uri (uri-host uri))))
+             (and uri (eq? (uri-scheme uri) 'https) (not (uri-userinfo uri))
+                  (or (not (uri-port uri)) (= (uri-port uri) 443))
+                  (string? host)
+                  (let ((host (string-downcase host)))
+                    (or (string=? host "mmg.whatsapp.net")
+                        (string-suffix? ".whatsapp.net" host))))))
+         (lambda _ #f))))
+
+(define (valid-direct-path? value)
+  (and (nonempty-string? value) (<= (string-length value) 8192)
+       (string-prefix? "/" value) (not (string-prefix? "//" value))
+       (not (string-any (lambda (c) (or (char-iso-control? c)
+                                        (char=? c #\\))) value))))
 
 (define (handle-download body-str)
-  (let* ((o    (safe-json-parse body-str))
-         (kind (and (pair? o) (assoc-ref o "kind"))))
-    (if (not (pair? o))
-        (json-response 400 '(("error" . "bad body")))
-        (let ((wpath (cond ((equal? kind "video")    "/chat/downloadvideo")
-                           ((equal? kind "gif")      "/chat/downloadvideo")
-                           ((equal? kind "audio")    "/chat/downloadaudio")
-                           ((equal? kind "document") "/chat/downloaddocument")
-                           ((equal? kind "sticker")  "/chat/downloadsticker")
-                           (else "/chat/downloadimage"))))
-          (relay 'POST wpath
-                 (filter-false
-                  (list (cons "Url"           (assoc-ref o "Url"))
-                        (cons "DirectPath"    (assoc-ref o "DirectPath"))
-                        (cons "MediaKey"      (assoc-ref o "MediaKey"))
-                        (cons "Mimetype"      (assoc-ref o "Mimetype"))
-                        (cons "FileSHA256"    (assoc-ref o "FileSHA256"))
-                        (cons "FileLength"    (assoc-ref o "FileLength"))
-                        (cons "FileEncSHA256" (assoc-ref o "FileEncSHA256")))))))))
+  (let* ((o (safe-json-parse body-str)) (kind (jget o "kind"))
+         (spec (assoc kind *media-specs*))
+         (url (jget o "Url")) (path (jget o "DirectPath"))
+         (key (jget o "MediaKey")) (size (jget o "FileLength"))
+         (numeric-size (cond ((number? size) size)
+                             ((string? size) (string->number size)) (else #f))))
+    (if (or (not spec) (not (nonempty-string? key))
+            (not (optional-string? key 256))
+            (not (optional-string? (jget o "Mimetype") 160))
+            (not (optional-string? (jget o "FileSHA256") 256))
+            (not (optional-string? (jget o "FileEncSHA256") 256))
+            (and (nonempty-string? url) (not (valid-download-url? url)))
+            (and (nonempty-string? path) (not (valid-direct-path? path)))
+            (not (or (valid-download-url? url) (valid-direct-path? path)))
+            (and size (not (and (integer? numeric-size) (exact? numeric-size)
+                               (<= 0 numeric-size *max-media-bytes*)))))
+        (json-response 400 '(("error" . "invalid media kind, download metadata or size")))
+        (relay 'POST (list-ref spec 3)
+          (filter-false (list (cons "Url" (and (nonempty-string? url) url))
+                             (cons "DirectPath" (and (nonempty-string? path) path))
+                             (cons "MediaKey" key) (cons "Mimetype" (jget o "Mimetype"))
+                             (cons "FileSHA256" (jget o "FileSHA256"))
+                             (cons "FileLength" numeric-size)
+                             (cons "FileEncSHA256" (jget o "FileEncSHA256"))))))))
 
 ;; --- telega-style actions: react / unreact / delete / mark read --------------
 (define (handle-react body-str)
@@ -612,9 +804,10 @@
          (id    (and (pair? o) (assoc-ref o "id")))
          (emoji (or (and (pair? o) (assoc-ref o "emoji")) ""))
          (mine  (and (pair? o) (eq? #t (assoc-ref o "me"))))
-         (mid   (if mine (string-append "me:" (or id "")) id)))
-    (if (or (not (string? to)) (not (string? id)))
-        (json-response 400 '(("error" . "missing 'to' or 'id'")))
+         (mid   (if (and mine (string? id)) (string-append "me:" id) id)))
+    (if (or (not (valid-target? to)) (not (valid-target? id))
+            (not (optional-string? emoji 64)))
+        (json-response 400 '(("error" . "missing 'to' or 'id', or invalid emoji")))
         (relay 'POST "/chat/react"
                (list (cons "Phone" to) (cons "Id" mid) (cons "Body" emoji))))))
 
@@ -623,8 +816,8 @@
          (to   (and (pair? o) (assoc-ref o "to")))
          (id   (and (pair? o) (assoc-ref o "id")))
          (mine (and (pair? o) (eq? #t (assoc-ref o "me"))))
-         (mid  (if mine (string-append "me:" (or id "")) id)))
-    (if (or (not (string? to)) (not (string? id)))
+         (mid  (if (and mine (string? id)) (string-append "me:" id) id)))
+    (if (or (not (valid-target? to)) (not (valid-target? id)))
         (json-response 400 '(("error" . "missing 'to' or 'id'")))
         (relay 'POST "/chat/delete" (list (cons "Phone" to) (cons "Id" mid))))))
 
@@ -632,7 +825,7 @@
   (let* ((o  (safe-json-parse body-str))
          (to (and (pair? o) (assoc-ref o "to")))
          (id (and (pair? o) (assoc-ref o "id"))))
-    (if (not (string? to))
+    (if (not (valid-target? to))
         (json-response 400 '(("error" . "missing 'to'")))
         (relay 'POST "/chat/markread"
                (list (cons "Id" (if (string? id) (vector id) #()))
@@ -644,13 +837,30 @@
 (define (handle-mediaretry body-str)
   (let* ((o  (safe-json-parse body-str))
          (id (and (pair? o) (assoc-ref o "id"))))
-    (if (not (string? id))
+    (if (not (valid-target? id))
         (json-response 400 '(("error" . "missing 'id'")))
         (relay 'POST "/chat/mediaretry" (list (cons "Id" id))))))
 
 (define (handle-webhook body-str)
-  (store-inbound! (extract-message body-str))
-  (json-response 200 '(("success" . #t))))
+  (let ((rec (extract-message body-str)))
+    (cond
+     ((not rec) (json-response 400 '(("error" . "invalid webhook JSON"))))
+     ;; Subscription/status events must never manufacture an unknown chat.
+     ((not (or (equal? (jget rec "type") "Message")
+               (and (not (jget rec "type")) (jget rec "id"))))
+      (json-response 200 '(("success" . #t) ("ignored" . #t))))
+     ((or (not (valid-target? (jget rec "chat" "from")))
+          (not (valid-target? (jget rec "id")))
+          (not (optional-string? (jget rec "name") 512))
+          (not (optional-string? (jget rec "text") *max-text-length*))
+          (not (optional-string? (jget rec "caption") *max-text-length*))
+          (not (optional-string? (jget rec "reply") *max-text-length*))
+          (not (optional-string? (jget rec "from") 256))
+          (not (parse-timestamp (jget rec "ts"))))
+      (json-response 400 '(("error" . "invalid message fields"))))
+     (else
+      (let ((stored? (store-inbound! rec)))
+        (json-response 200 (list (cons "success" #t) (cons "duplicate" (not stored?)))))))))
 
 (define (handle-chats)
   (with-mutex *smutex*
@@ -672,15 +882,18 @@
                                  (cons "ts" (or lts "")))
                            out))))
        *chats*)
-      (json-response 200 (list->vector out)))))
+      (json-response 200 (list->vector
+        (sort out (lambda (a b)
+          (let ((ta (timestamp-value a)) (tb (timestamp-value b)))
+            (if (= ta tb) (string<? (jget a "jid") (jget b "jid")) (> ta tb))))))))))
 
 (define (handle-chat-messages query)
   (let ((jid (form-param query "jid")))
-    (if (not jid)
+    (if (not (valid-target? jid))
         (json-response 400 '(("error" . "missing jid")))
         (with-mutex *smutex*
-          (let ((msgs (hash-ref *chats* jid '())))
-            (hash-set! *unread* jid 0)
+          (let* ((key (normalize-jid jid)) (msgs (hash-ref *chats* key '())))
+            (when (hash-ref *chats* key #f) (hash-set! *unread* key 0))
             (json-response 200 (list->vector msgs)))))))
 
 (define (authed? headers)
@@ -690,7 +903,7 @@
 ;;; Dispatch
 ;;; ---------------------------------------------------------------------------
 
-(define (handler request body)
+(define (dispatch request body)
   (let ((method  (request-method request))
         (path    (uri-path (request-uri request)))
         (query   (uri-query (request-uri request)))
@@ -724,11 +937,35 @@
      ((and (eq? method 'POST) (string=? path "/sync"))
       (let* ((o   (and (> (string-length body*) 0) (safe-json-parse body*)))
              (jid (and (pair? o) (assoc-ref o "jid"))))
-        (if (string? jid)
-            (begin (import-chat! (hash-ref *rawjid* jid jid))
-                   (json-response 200 '(("imported" . 1))))
-            (json-response 200 (list (cons "imported" (sync-history!)))))))
+        (cond
+         ((or (and (> (string-length body*) 0) (not o))
+              (and jid (not (valid-target? jid))))
+          (json-response 400 '(("error" . "invalid sync request"))))
+         ((string? jid)
+          (import-chat! (with-mutex *smutex* (hash-ref *rawjid* (normalize-jid jid) jid)))
+          (json-response 200 '(("imported" . 1))))
+         (else
+          (let ((imported (sync-history!)))
+            (if imported (json-response 200 (list (cons "imported" imported)))
+                (json-response 502 '(("error" . "history upstream unavailable")))))))))
      (else (json-response 404 '(("error" . "not found")))))))
+
+(define (handler request body)
+  (catch #t
+    (lambda ()
+      (let ((size (cond ((bytevector? body) (bytevector-length body))
+                        ((string? body) (bytevector-length (string->utf8 body)))
+                        (else 0))))
+        ;; Guile's HTTP server has already buffered the body at this stage.
+        ;; Enforce an ingress body/timeout limit in front of public deployments.
+        (if (> size *max-body-bytes*)
+            (json-response 413 '(("error" . "request exceeds body limit")))
+            (dispatch request body))))
+    ;; Malformed JSON/UTF-8/metadata should never crash a running listener.
+    (lambda (key . args)
+      (if (eq? key 'upstream-failure)
+          (json-response 502 '(("error" . "history upstream unavailable")))
+          (json-response 400 '(("error" . "invalid request")))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Entry point
@@ -737,7 +974,7 @@
 (define (main)
   (format #t "whatsappel: bridge on http://~a:~a -> wuzapi ~a~%"
           *host* *port* *wuzapi-base*)
-  (format #t "whatsappel: inbound webhook ~a~%" *hook-url*)
+  (format #t "whatsappel: webhook configured (credential redacted)~%")
   ;; Import existing chats/history from wuzapi in the background (non-fatal),
   ;; so the chat list is populated on startup without waiting for live traffic.
   (call-with-new-thread
@@ -747,4 +984,5 @@
        (lambda (k . a) (format #t "whatsappel: initial sync failed: ~a~%" k)))))
   (run-server handler 'http (list #:host *host* #:port *port*)))
 
-(main)
+;; Load definitions for tests/static checks without starting a listener.
+(unless (member "--check-load" (command-line)) (main))

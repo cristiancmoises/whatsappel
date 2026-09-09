@@ -25,3 +25,9 @@ target/
 
 # Release artifacts (built, not tracked)
 /dist/
+
+# Local test reports and Python caches
+/audit/results/
+__pycache__/
+*.pyc
+/whatsappel.go

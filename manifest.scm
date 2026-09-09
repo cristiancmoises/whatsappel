@@ -13,3 +13,7 @@
        "guile-json"
        ;; Only needed if WUZAPI_BASE_URL is https (default is loopback http).
        "guile-gnutls"))
+
+;; For the full development/audit toolchain:
+;; guix shell -m manifest.scm emacs-minimal fish python git gcc-toolchain rust cargo
+;; GUI use needs an Emacs build with the corresponding image decoders.
