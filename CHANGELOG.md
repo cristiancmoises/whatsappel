@@ -3,6 +3,31 @@
 All notable changes to WhatsApp.el are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [3.2.0-rc1] — 2026-09-09
+
+### Added
+- Mouse-first workspace launcher and sidebar; explicit attachment preview/send stage.
+- Bounded 100-message initial render with Show older, preview-spec cache and coalesced image repaint.
+- Asynchronous text sends and a size-bounded Python upload worker with account-pinned recipients.
+- Fit/zoom/original image controls and hardened local mpv playback with owned temporary-file cleanup.
+- Explicit FFmpeg voice capture (Opus audio), Stop/Preview/Send, and optional GIF-to-MP4 copies.
+- Hash-anchored candidate-audited updates, rollback journals and strict-host-key IONOS deployment.
+- Isolated publication worktree, curated commit paths and four-forge hidden-token publication.
+- Native ERT regressions plus Python, loopback HTTP, media-fixture, archive and Git isolation tests.
+- English and Brazilian Portuguese guides, release-audit limitations and implementation prompt.
+
+### Fixed
+- Synchronous interactive sending, whole-history rendering for every image completion,
+  and repeated decoding of cached previews.
+- Media mouse events using an unrelated cursor position; newer draft text being deleted on send.
+- Player files being removed by an arbitrary timer rather than player lifetime.
+- Inconsistent attachment transport labels and token-bearing TLS key-log inheritance.
+
+### Validation status
+- See docs/AUDIT-3.2.0-rc1.md for executed tests and explicit BLOCKED/NOT RUN gates.
+- No live WhatsApp sends, production deployment or forge pushes were performed during preparation.
+- Bridge/PQ code and state are intentionally outside this delta. No new cryptographic claim is made.
+
 ## [3.1.0] — 2026-09-09 (upgrade candidate)
 
 ### Added

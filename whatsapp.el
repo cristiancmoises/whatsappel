@@ -5,7 +5,7 @@
 ;;
 ;; Author: Cristian Cezar Moisés
 ;; URL: https://codeberg.org/berkeley/whatsappel
-;; Version: 3.1.0
+;; Version: 3.2.0pre1
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: comm, whatsapp
 
@@ -56,8 +56,9 @@ Sent in the X-Whatsappel-Token header on every request."
   "Seconds between polls when polling is enabled."
   :type 'integer)
 
-(defcustom whatsapp-media-player "xdg-open"
-  "External program used to open audio, video and GIF media."
+(defcustom whatsapp-media-player "mpv"
+  "mpv executable used to open audio, video and GIF media.
+Arguments disable user scripts and referenced resources; use an mpv-compatible program."
   :type 'string)
 
 (defcustom whatsapp-auto-load-images t
@@ -133,6 +134,55 @@ old captured envelopes; tolerates clock skew and delayed delivery."
 (defvar-local whatsapp-chat--input-marker nil "Marker at the start of the input area.")
 (defvar-local whatsapp-chat--reply nil
   "Pending reply target: plist (:id :participant :text :who), or nil.")
+
+(defconst whatsapp-version "3.2.0-rc1" "Workspace release candidate version.")
+
+(defconst whatsapp--source-directory
+  (file-name-directory (or load-file-name buffer-file-name default-directory)))
+(defcustom whatsapp-python-program "python3"
+  "Python 3 used for isolated attachment uploads and explicit GIF conversion."
+  :type 'string :group 'whatsapp)
+(defcustom whatsapp-history-page-size 100
+  "Messages initially rendered per conversation; Show older expands the view."
+  :type 'integer :group 'whatsapp)
+(defcustom whatsapp-image-pixel-limit 16000000
+  "Largest canvas decoded by the image preview, in pixels."
+  :type 'integer :group 'whatsapp)
+(defcustom whatsapp-preview-pixel-budget 16000000
+  "Total declared source pixels retained by the eight-entry preview cache."
+  :type 'integer :group 'whatsapp)
+(defcustom whatsapp-voice-seconds 180
+  "Maximum duration of an explicitly started voice recording, in seconds."
+  :type 'integer :group 'whatsapp)
+(defcustom whatsapp-voice-device "default"
+  "PulseAudio input device; PipeWire's PulseAudio server also accepts default."
+  :type 'string :group 'whatsapp)
+(defcustom whatsapp-workspace-sidebar t
+  "Keep a chat-list side window when opening the mouse-first workspace."
+  :type 'boolean :group 'whatsapp)
+(defvar whatsapp--workspace-active nil)
+(defvar whatsapp--preview-cache (make-hash-table :test 'equal))
+(defvar whatsapp--preview-order nil)
+(defvar whatsapp--media-jobs nil "Owned mpv processes; no private data is logged.")
+(defvar-local whatsapp-chat--history-limit nil)
+(defvar-local whatsapp-chat--send-pending nil)
+(defvar-local whatsapp-chat--redraw-timer nil)
+(defvar-local whatsapp--stage-target nil)
+(defvar-local whatsapp--stage-origin nil)
+(defvar-local whatsapp--stage-file nil)
+(defvar-local whatsapp--stage-kind nil)
+(defvar-local whatsapp--stage-caption "")
+(defvar-local whatsapp--stage-operation nil)
+(defvar-local whatsapp--stage-process nil)
+(defvar-local whatsapp--stage-owned nil)
+(defvar-local whatsapp--stage-error nil)
+(defvar-local whatsapp--stage-url nil)
+(defvar-local whatsapp--stage-token-id nil)
+(defvar-local whatsapp--view-bytes nil)
+(defvar-local whatsapp--view-type nil)
+(defvar-local whatsapp--view-mime nil)
+(defvar-local whatsapp--view-zoom nil)
+
 
 ;;; ---------------------------------------------------------------------------
 ;;; HTTP + small helpers
@@ -304,9 +354,15 @@ a GIF file is never mislabeled as an MP4. Looping and codecs depend on upstream.
     "application/octet-stream"))
 
 (defun whatsapp--data-uri-bytes (uri)
-  "Return the decoded (unibyte) bytes from a data URI string URI."
-  (let ((b64 (if (string-match ",\\(.*\\)\\'" uri) (match-string 1 uri) uri)))
-    (base64-decode-string b64)))
+  "Decode a bounded strict base64 data URI, rejecting oversized media first."
+  (unless (and (stringp uri)
+               (<= (string-bytes uri) (+ 256 (* 4 (/ (+ whatsapp-max-file-bytes 2) 3))))
+               (string-match "\\`data:[A-Za-z0-9.+/-]+;base64,\\([A-Za-z0-9+/]*=*\\)\\'" uri))
+    (user-error "Invalid or oversized media data URI"))
+  (let ((bytes (base64-decode-string (match-string 1 uri))))
+    (when (> (string-bytes bytes) whatsapp-max-file-bytes)
+      (user-error "Media exceeds the configured size limit"))
+    bytes))
 
 (defun whatsapp--image-type-from-mime (mime)
   "Map MIME to an Emacs image type symbol."
@@ -319,8 +375,9 @@ a GIF file is never mislabeled as an MP4. Looping and codecs depend on upstream.
 ;;; ---------------------------------------------------------------------------
 
 (defun whatsapp--media-key (id kind)
-  "Namespace cached ID by this chat and media KIND."
-  (list whatsapp-chat--jid id kind))
+  "Namespace ID by account, origin, chat and media KIND."
+  (list whatsapp-bridge-url (secure-hash 'sha256 (or whatsapp-bridge-token ""))
+        whatsapp-chat--jid id kind))
 
 (defun whatsapp--cache-get (key)
   "Read KEY and update media recency."
@@ -338,12 +395,16 @@ a GIF file is never mislabeled as an MP4. Looping and codecs depend on upstream.
       (while (and (> bytes whatsapp-media-cache-max-bytes) whatsapp--media-order)
         (let* ((old (pop whatsapp--media-order)) (v (gethash old whatsapp--media-cache)))
           (when v (cl-decf bytes (string-bytes v)))
-          (remhash old whatsapp--media-cache))))))
+          (remhash old whatsapp--media-cache)
+          (remhash old whatsapp--preview-cache)
+          (setq whatsapp--preview-order (delete old whatsapp--preview-order)))))))
 
 (defun whatsapp-clear-caches ()
   "Discard downloaded media and cached decrypted/sent plaintext from memory."
   (interactive)
   (clrhash whatsapp--media-cache)
+  (clrhash whatsapp--preview-cache)
+  (setq whatsapp--preview-order nil)
   (let (finished)
     (maphash (lambda (k v) (when (eq v 'done) (push k finished))) whatsapp--media-pending)
     (dolist (k finished) (remhash k whatsapp--media-pending)))
@@ -406,7 +467,7 @@ a GIF file is never mislabeled as an MP4. Looping and codecs depend on upstream.
                  (whatsapp--cache-put key uri)
                  (when (and (buffer-live-p buffer) (gethash key whatsapp--media-cache))
                    (with-current-buffer buffer
-                     (whatsapp-chat--render whatsapp-chat--messages))))
+                     (whatsapp--schedule-media-redraw))))
                (whatsapp--media-pump)))
           (error (puthash key 'done whatsapp--media-pending)
                  (cl-decf whatsapp--media-active)))))))
@@ -415,38 +476,32 @@ a GIF file is never mislabeled as an MP4. Looping and codecs depend on upstream.
   "Return a safe local suffix for MIME, never a path from remote input."
   (concat "." (or (car (rassoc mime whatsapp--mime-types)) "bin")))
 
-(defun whatsapp-chat-open-media-at-point ()
-  "Open or preview original message media on explicit user request."
-  (interactive)
+(defun whatsapp-chat-open-media-at-point (&optional event)
+  "Open the selected original media asynchronously; EVENT selects the clicked message."
+  (interactive (list (when (mouse-event-p last-input-event) last-input-event)))
+  (when event (mouse-set-point event))
   (let* ((m (whatsapp--message-at-point)) (media (whatsapp--msg-field m "media"))
-         (kind (whatsapp--msg-field m "kind")) (id (whatsapp--msg-field m "id")))
+         (kind (whatsapp--msg-field m "kind")) (id (whatsapp--msg-field m "id"))
+         (key (whatsapp--media-key id kind)) (cached (whatsapp--cache-get key))
+         (buffer (current-buffer)))
     (unless media (user-error "No downloadable media on this message"))
-    (let* ((uri (whatsapp--media-data id kind media))
-           (mime (and uri (whatsapp--data-uri-mime uri)))
-           (type (and mime (whatsapp--image-type-from-mime mime))))
-      (unless uri (user-error "Download failed; the media may have expired"))
-      (if (and type (display-graphic-p) (image-type-available-p type))
-          (let ((buffer (get-buffer-create "*WhatsApp media*")))
-            (with-current-buffer buffer
-              (let ((inhibit-read-only t))
-                (erase-buffer)
-                (insert-image (create-image (whatsapp--data-uri-bytes uri) type t))
-                (special-mode)))
-            (pop-to-buffer buffer))
-        (unless (executable-find whatsapp-media-player)
-          (user-error "Media opener %s is unavailable" whatsapp-media-player))
-        (let ((file (make-temp-file "whatsapp-media-" nil (whatsapp--media-suffix mime))))
-          (let ((coding-system-for-write 'binary))
-            (with-temp-file file (set-buffer-multibyte nil)
-                            (insert (whatsapp--data-uri-bytes uri))))
-          (condition-case err
-              (progn
-                (start-process "whatsapp-media" nil whatsapp-media-player file)
-                ;; Desktop openers exit before their viewer; allow ten minutes
-                ;; before removing the temporary original, also clean on exit.
-                (run-at-time 600 nil (lambda () (ignore-errors (delete-file file))))
-                (add-hook 'kill-emacs-hook (lambda () (ignore-errors (delete-file file)))))
-            (error (delete-file file) (signal (car err) (cdr err)))))))))
+    (if cached (whatsapp--open-uri cached kind)
+      (when (memq (gethash key whatsapp--media-pending) '(opening active queued))
+        (user-error "This media download is in progress; click again when its preview appears"))
+      (puthash key 'opening whatsapp--media-pending)
+      (condition-case err
+          (whatsapp--request-async
+           "POST" "/download" (append (list (cons "kind" kind)) media)
+           (lambda (result)
+             (remhash key whatsapp--media-pending)
+             (let ((uri (whatsapp--download-uri result)))
+               (if (not uri) (message "WhatsApp: media unavailable; use Retry or check the connection")
+                 (whatsapp--cache-put key uri)
+                 (when (buffer-live-p buffer)
+                   (condition-case nil
+                       (whatsapp--open-uri uri kind)
+                     (error (message "WhatsApp: no safe preview; use Save original on the message"))))))))
+        (error (remhash key whatsapp--media-pending) (signal (car err) (cdr err)))))))
 
 (defvar whatsapp-media-keymap
   (let ((m (make-sparse-keymap)))
@@ -496,7 +551,7 @@ a GIF file is never mislabeled as an MP4. Looping and codecs depend on upstream.
          (type (and uri (whatsapp--image-type-from-mime (whatsapp--data-uri-mime uri)))))
     (if (and uri type (display-graphic-p) (image-type-available-p type))
         (condition-case nil
-            (insert-image (whatsapp--create-image (whatsapp--data-uri-bytes uri) type kind))
+            (insert-image (whatsapp--preview-image (whatsapp--media-key id kind) uri type kind))
           (error (insert (format "[%s · open or save original]" kind))))
       (insert (format "[%s · RET to open · C-c C-s to save]" kind)))
     (when media (whatsapp--tag-media beg (point) media kind id))
@@ -859,6 +914,8 @@ message); otherwise the quote is shown locally but not threaded server-side."
 (defun whatsapp-chat--render (messages)
   "Render MESSAGES without losing draft, message position, or window scroll."
   (let* ((input (whatsapp-chat--current-input))
+         (limit (max 1 (or whatsapp-chat--history-limit whatsapp-history-page-size)))
+         (visible (last messages limit))
          (initial (not whatsapp-chat--input-marker))
          (saved-point (whatsapp-chat--position (point)))
          (windows (mapcar (lambda (w)
@@ -882,10 +939,19 @@ message); otherwise the quote is shown locally but not threaded server-side."
     (unless messages
       (insert (propertize "Your conversation starts here. Type below, then press Enter.\n\n"
                           'face 'shadow)))
-    (dolist (m messages) (whatsapp--insert-message m))
+    (when (> (length messages) limit)
+      (insert (propertize (format "Showing the latest %d of %d retained messages.  "
+                                  limit (length messages)) 'face 'shadow))
+      (whatsapp--button "Show older" #'whatsapp-chat-show-older)
+      (insert "\n\n"))
+    (dolist (m visible) (whatsapp--insert-message m))
     (insert (propertize "\nCompose  ·  Enter sends  ·  C-j adds a line\n" 'face 'shadow))
-    (whatsapp--button "Send" #'whatsapp-chat-send-input)
-    (whatsapp--button "Attach…" #'whatsapp-chat-attach)
+    (whatsapp--button (if whatsapp-chat--send-pending "Sending…" "Send") #'whatsapp-chat-send-input)
+    (whatsapp--button "Image…" #'whatsapp-chat-attach-image)
+    (whatsapp--button "Video…" #'whatsapp-chat-attach-video)
+    (whatsapp--button "GIF…" #'whatsapp-chat-attach-gif)
+    (whatsapp--button "Record voice" #'whatsapp-chat-record-voice)
+    (whatsapp--button "File…" #'whatsapp-chat-attach-original)
     (whatsapp--button "Encrypted send" #'whatsapp-chat-send-encrypted)
     (insert "\n")
     (when whatsapp-chat--reply
@@ -971,37 +1037,59 @@ AFTER-SEND requests a follow-up if an older request is still running."
   (interactive)
   (insert "\n"))
 
+(defun whatsapp--send-accepted-p (result)
+  "Require the bridge to confirm a successful upstream send, not just HTTP 200."
+  (and (whatsapp--ok-p (car result)) (listp (cdr result))
+       (let ((upstream (cdr (assoc "wuzapi_status" (cdr result)))))
+         (and (integerp upstream) (<= 200 upstream) (< upstream 300)))))
+
 (defun whatsapp-chat-send-input ()
-  "Send the text in the input area to this chat."
+  "Send the draft asynchronously once; preserve edits made during the request."
   (interactive)
-  (let* ((input (string-trim (whatsapp-chat--current-input)))
-         (r     whatsapp-chat--reply)
+  (when whatsapp-chat--send-pending (user-error "A send is already in progress"))
+  (unless whatsapp-chat--target (user-error "Open a WhatsApp conversation first"))
+  (let* ((original (whatsapp-chat--current-input)) (input (string-trim original))
+         (reply whatsapp-chat--reply) (buffer (current-buffer))
          (payload (append (list (cons "to" whatsapp-chat--target) (cons "body" input))
-                          (when (and r (plist-get r :participant))
-                            (list (cons "reply_id" (plist-get r :id))
-                                  (cons "reply_participant" (plist-get r :participant))
-                                  (cons "reply_text" (or (plist-get r :text) "")))))))
-    (if (= (length input) 0)
-        (message "whatsapp: nothing to send")
-      (let ((res (whatsapp--request "POST" "/send" payload)))
-        (if (whatsapp--ok-p (car res))
-            (progn
-              (setq whatsapp-chat--reply nil)
-              (let ((inhibit-read-only t))
-                (when (marker-position whatsapp-chat--input-marker)
-                  (delete-region whatsapp-chat--input-marker (point-max))))
-              (whatsapp-chat-refresh t))
-          (user-error "whatsapp: send failed: %S" (cdr res)))))))
+                          (when (and reply (plist-get reply :participant))
+                            (list (cons "reply_id" (plist-get reply :id))
+                                  (cons "reply_participant" (plist-get reply :participant))
+                                  (cons "reply_text" (or (plist-get reply :text) "")))))))
+    (unless (string-empty-p input)
+      (when (> (length input) 65536) (user-error "Message exceeds the 65536-character limit"))
+      (setq whatsapp-chat--send-pending t)
+      (force-mode-line-update)
+      (condition-case err
+          (whatsapp--request-async
+           "POST" "/send" payload
+           (lambda (result)
+             (when (buffer-live-p buffer)
+               (with-current-buffer buffer
+                 (setq whatsapp-chat--send-pending nil)
+                 (if (whatsapp--send-accepted-p result)
+                     (progn
+                       (when (equal reply whatsapp-chat--reply) (setq whatsapp-chat--reply nil))
+                       ;; Never delete newer text typed while this send was in flight.
+                       (when (equal original (whatsapp-chat--current-input))
+                         (let ((inhibit-read-only t))
+                           (delete-region whatsapp-chat--input-marker (point-max))))
+                       (whatsapp-chat-refresh t)
+                       (message "WhatsApp: message accepted by the bridge"))
+                   (setq whatsapp--last-error "Delivery unconfirmed. Draft retained; check chat before retrying.")
+                   (message "WhatsApp: %s" whatsapp--last-error))
+                 (force-mode-line-update)))))
+        (error (setq whatsapp-chat--send-pending nil)
+               (force-mode-line-update) (signal (car err) (cdr err)))))))
 
 (defun whatsapp--send-media (kind file &optional caption)
-  "Send FILE of KIND to this chat, preserving original bytes and CAPTION."
-  (unless whatsapp-chat--target (user-error "Open a WhatsApp chat first"))
-  (if (whatsapp--send-media-to whatsapp-chat--target kind file caption)
-      (progn (message "WhatsApp: attachment sent") (whatsapp-chat-refresh t))
-    (user-error "Attachment send failed; check bridge status and media compatibility")))
+  "Stage FILE of KIND with CAPTION; uploading requires the visible Send button."
+  (unless whatsapp-chat--target (user-error "Open a WhatsApp conversation first"))
+  (whatsapp--validate-file file)
+  (when (file-symlink-p file) (user-error "Choose a regular file, not a symbolic link"))
+  (whatsapp--stage-create kind (expand-file-name file) caption))
 
 (defun whatsapp-chat-attach-original (file)
-  "Send FILE as an original document, including full-resolution photos.
+  "Stage FILE as an original document, including full-resolution photos.
 The document transport avoids WhatsApp's photo recompression."
   (interactive "fOriginal file: ")
   (whatsapp--send-media 'document file))
@@ -1020,8 +1108,7 @@ The document transport avoids WhatsApp's photo recompression."
                    (completing-read "Send as: "
                                     (list "Original file" (format "%s preview" (capitalize (symbol-name kind))))
                                     nil t nil nil "Original file"))))
-    (whatsapp--send-media (if (equal choice "Original file") 'document kind) file
-                         (unless (equal choice "Original file") (read-string "Caption: ")))))
+    (whatsapp--send-media (if (equal choice "Original file") 'document kind) file)))
 
 (defun whatsapp-command-menu ()
   "Offer discoverable commands appropriate for the dashboard or current chat."
@@ -1049,27 +1136,27 @@ The document transport avoids WhatsApp's photo recompression."
   (customize-group 'whatsapp))
 
 (defun whatsapp-chat-attach-image (file)
-  "Attach and send image FILE."
+  "Choose image FILE for the Preview/Send attachment stage."
   (interactive "fImage: ")
-  (whatsapp--send-media 'image file (read-string "Caption: ")))
+  (whatsapp--send-media 'image file))
 
 (defun whatsapp-chat-attach-video (file)
-  "Attach and send video FILE."
+  "Choose video FILE for the Preview/Send attachment stage."
   (interactive "fVideo: ")
-  (whatsapp--send-media 'video file (read-string "Caption: ")))
+  (whatsapp--send-media 'video file))
 
 (defun whatsapp-chat-attach-audio (file)
-  "Attach and send audio FILE."
+  "Choose audio FILE for the Preview/Send attachment stage."
   (interactive "fAudio: ")
   (whatsapp--send-media 'audio file))
 
 (defun whatsapp-chat-attach-file (file)
-  "Attach and send document FILE."
+  "Choose document FILE for the explicit Send attachment stage."
   (interactive "fFile: ")
   (whatsapp--send-media 'document file))
 
 (defun whatsapp-chat-attach-sticker (file)
-  "Attach and send a webp sticker FILE."
+  "Choose WebP sticker FILE for the Preview/Send attachment stage."
   (interactive "fSticker (webp): ")
   (whatsapp--send-media 'sticker file))
 
@@ -1089,6 +1176,7 @@ Looping playback depends on upstream support."
     (define-key map (kbd "f") #'whatsapp-chat-attach-file)
     (define-key map (kbd "s") #'whatsapp-chat-attach-sticker)
     (define-key map (kbd "g") #'whatsapp-chat-attach-gif)
+    (define-key map (kbd "r") #'whatsapp-chat-record-voice)
     map)
   "Attach submenu, bound to C-c C-a in a chat buffer.")
 
@@ -1121,7 +1209,8 @@ input area; media commands live on the per-line `whatsapp-media-keymap'.")
   (setq-local truncate-lines nil)
   (setq-local line-spacing 0.18)
   (setq-local mode-line-process
-              '(:eval (cond (whatsapp--refresh-pending " · refreshing")
+              '(:eval (cond (whatsapp-chat--send-pending " · sending")
+                            (whatsapp--refresh-pending " · refreshing")
                             (whatsapp--last-error " · offline"))))
   (setq-local header-line-format " WhatsAppel  ·  C-c ? commands  ·  C-c C-a attach  ·  C-c C-l refresh"))
 
@@ -1139,7 +1228,16 @@ input area; media commands live on the per-line `whatsapp-media-keymap'.")
   (when (string-empty-p (string-trim jid)) (user-error "Enter a chat number or JID"))
   (let ((buf (whatsapp--chat-buffer jid)))
     (with-current-buffer buf (whatsapp-chat-refresh))
-    (pop-to-buffer buf)))
+    (if (and whatsapp--workspace-active whatsapp-workspace-sidebar (> (frame-width) 90))
+        (progn
+          (display-buffer-in-side-window (whatsapp--root-buffer)
+                                         '((side . left) (slot . 0) (window-width . 34)))
+          (when-let ((main (cl-find-if (lambda (window)
+                                        (not (window-parameter window 'window-side)))
+                                      (window-list))))
+            (select-window main))
+          (switch-to-buffer buf))
+      (pop-to-buffer buf))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Root (chat list)
@@ -1168,6 +1266,12 @@ input area; media commands live on the per-line `whatsapp-media-keymap'.")
                              (format "%s %s %s" (cdr (assoc "name" chat))
                                      (cdr (assoc "jid" chat)) (cdr (assoc "last" chat))))))))
 
+(defvar whatsapp-root-row-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [mouse-1] #'whatsapp-root-click)
+    (define-key map (kbd "RET") #'whatsapp-root-open-chat)
+    map))
+
 (defun whatsapp-root--render (chats)
   "Render CHATS as native buttons with unread, group, and search filters."
   (let ((inhibit-read-only t)
@@ -1175,7 +1279,7 @@ input area; media commands live on the per-line `whatsapp-media-keymap'.")
         (old-point (point))
         (visible (cl-remove-if-not #'whatsapp-root--visible-p chats)))
     (erase-buffer)
-    (insert (propertize "WhatsAppel\n" 'face 'whatsapp-title))
+    (insert (propertize (format "WhatsAppel %s\n" whatsapp-version) 'face 'whatsapp-title))
     (insert (propertize (format "%d conversations  ·  %d unread\n\n"
                                 (length chats)
                                 (cl-count-if (lambda (c) (> (or (cdr (assoc "unread" c)) 0) 0)) chats))
@@ -1216,7 +1320,8 @@ input area; media commands live on the per-line `whatsapp-media-keymap'.")
           (when (> unread 0) (insert (propertize (format "  [%d]" unread) 'face 'whatsapp-accent)))
           (insert (propertize (format "   %s\n" (whatsapp--fmt-ts (cdr (assoc "ts" c)))) 'face 'shadow))
           (insert "     " (truncate-string-to-width preview 90 nil nil "…") "\n\n")
-          (add-text-properties beg (point) (list 'whatsapp-jid jid 'mouse-face 'highlight)))))
+          (add-text-properties beg (point) (list 'whatsapp-jid jid 'mouse-face 'highlight
+                                                'keymap whatsapp-root-row-map)))))
     (insert (propertize "Enter opens  ·  / searches  ·  ? commands  ·  Tab visits buttons\n" 'face 'shadow))
     (goto-char (or (and jid-at-point (whatsapp-root--chat-position jid-at-point))
                    (min old-point (point-max)))))
@@ -1650,6 +1755,518 @@ Uses the current chat buffer's `whatsapp-chat--jid' as the peer."
     ["Refresh" whatsapp-root-refresh t]
     ["Automatic refresh" whatsapp-toggle-polling :style toggle :selected whatsapp--poll-timer]
     ["Settings…" whatsapp-customize t]))
+
+;;; ---------------------------------------------------------------------------
+;;; 3.2 workspace: bounded rendering, owned media jobs, and explicit send preview
+;;; ---------------------------------------------------------------------------
+
+(defun whatsapp-chat-show-older ()
+  "Expand the visible history without discarding the current draft."
+  (interactive)
+  (setq whatsapp-chat--history-limit
+        (+ (or whatsapp-chat--history-limit (max 1 whatsapp-history-page-size))
+           (max 1 whatsapp-history-page-size)))
+  (whatsapp-chat--render whatsapp-chat--messages))
+
+(defun whatsapp--schedule-media-redraw ()
+  "Coalesce preview completions into one delayed repaint per live buffer."
+  (unless whatsapp-chat--redraw-timer
+    (let ((buffer (current-buffer)))
+      (setq whatsapp-chat--redraw-timer
+            (run-at-time
+             0.12 nil
+             (lambda ()
+               (when (buffer-live-p buffer)
+                 (with-current-buffer buffer
+                   (setq whatsapp-chat--redraw-timer nil)
+                   (whatsapp-chat--render whatsapp-chat--messages)))))))))
+
+(defun whatsapp--uint (bytes offset count &optional little)
+  "Read COUNT bytes of unsigned integer at OFFSET in BYTES."
+  (when (> (+ offset count) (length bytes)) (error "Truncated image header"))
+  (let ((n 0))
+    (dotimes (i count n)
+      (setq n (+ (ash n 8) (aref bytes (+ offset (if little (- count 1 i) i))))))))
+
+(defun whatsapp--image-dimensions (bytes type)
+  "Read PNG, JPEG or static WebP canvas dimensions without native decoding.
+Return (WIDTH . HEIGHT), or nil for unsupported, animated or malformed data."
+  (condition-case nil
+      (pcase type
+        ('png (when (and (>= (length bytes) 24)
+                         (equal (substring bytes 0 8) (unibyte-string 137 80 78 71 13 10 26 10))
+                         (equal (substring bytes 12 16) "IHDR"))
+                (cons (whatsapp--uint bytes 16 4) (whatsapp--uint bytes 20 4))))
+        ('jpeg
+         (when (and (>= (length bytes) 4)
+                    (= (aref bytes 0) 255) (= (aref bytes 1) 216))
+           (let ((i 2) found stop)
+             (while (and (not found) (not stop) (< (+ i 3) (length bytes)))
+               (if (/= (aref bytes i) 255) (setq stop t)
+                 (while (and (< i (length bytes)) (= (aref bytes i) 255)) (cl-incf i))
+                 (let ((marker (aref bytes i)))
+                   (cl-incf i)
+                   (cond
+                    ((memq marker '(217 218)) (setq stop t))
+                    ((or (= marker 1) (<= 208 marker 216)))
+                    (t
+                     (let ((size (whatsapp--uint bytes i 2)))
+                       (when (or (< size 2) (> (+ i size) (length bytes)))
+                         (error "Invalid JPEG segment"))
+                       (when (memq marker '(192 193 194 195 197 198 199 201 202 203 205 206 207))
+                         (when (< size 8) (error "Invalid JPEG frame"))
+                         (setq found (cons (whatsapp--uint bytes (+ i 5) 2)
+                                           (whatsapp--uint bytes (+ i 3) 2))))
+                       (cl-incf i size)))))))
+             found)))
+        ('webp
+         (when (and (>= (length bytes) 30) (equal (substring bytes 0 4) "RIFF")
+                    (equal (substring bytes 8 12) "WEBP"))
+           (pcase (substring bytes 12 16)
+             ("VP8X" (when (= 0 (logand (aref bytes 20) 2))
+                       (cons (1+ (whatsapp--uint bytes 24 3 t))
+                             (1+ (whatsapp--uint bytes 27 3 t)))))
+             ("VP8L" (when (= (aref bytes 20) 47)
+                       (let ((bits (whatsapp--uint bytes 21 4 t)))
+                         (cons (1+ (logand bits #x3fff))
+                               (1+ (logand (ash bits -14) #x3fff))))))
+             ("VP8 " (when (equal (substring bytes 23 26) (unibyte-string 157 1 42))
+                       (cons (logand (whatsapp--uint bytes 26 2 t) #x3fff)
+                             (logand (whatsapp--uint bytes 28 2 t) #x3fff))))))))
+    (error nil)))
+
+(defun whatsapp--checked-image-pixels (bytes type)
+  "Reject unknown or oversized canvases before invoking an image decoder."
+  (let ((dimensions (whatsapp--image-dimensions bytes type)))
+    (unless (and dimensions (> (car dimensions) 0) (> (cdr dimensions) 0)
+                 (<= (car dimensions) 16384) (<= (cdr dimensions) 16384)
+                 (<= (* (car dimensions) (cdr dimensions)) whatsapp-image-pixel-limit))
+      (user-error "Preview unavailable or canvas too large; save the original instead"))
+    (* (car dimensions) (cdr dimensions))))
+
+(defun whatsapp--preview-image (key uri type kind)
+  "Reuse a decoded preview for KEY, preserving original URI bytes."
+  (let ((entry (gethash key whatsapp--preview-cache)))
+    (unless (and entry (equal uri (nth 0 entry)))
+      (remhash key whatsapp--preview-cache)
+      (setq whatsapp--preview-order (delete key whatsapp--preview-order))
+      (let* ((bytes (whatsapp--data-uri-bytes uri))
+             (pixels (whatsapp--checked-image-pixels bytes type))
+             (image (whatsapp--create-image bytes type kind)))
+        (setq entry (list uri image pixels))
+        (when (<= pixels whatsapp-preview-pixel-budget)
+          (puthash key entry whatsapp--preview-cache))))
+    (when (gethash key whatsapp--preview-cache)
+      (setq whatsapp--preview-order (append (delete key whatsapp--preview-order) (list key))))
+    (let ((pixels 0))
+      (maphash (lambda (_k v) (cl-incf pixels (nth 2 v))) whatsapp--preview-cache)
+      (while (and whatsapp--preview-order
+                  (or (> pixels whatsapp-preview-pixel-budget)
+                      (> (hash-table-count whatsapp--preview-cache) 8)))
+        (let* ((old (pop whatsapp--preview-order)) (value (gethash old whatsapp--preview-cache)))
+          (when value (cl-decf pixels (nth 2 value)))
+          (remhash old whatsapp--preview-cache))))
+    (nth 1 entry)))
+
+(defun whatsapp--media-environment ()
+  "Do not pass bridge tokens or TLS debug logging to media subprocesses."
+  (cl-remove-if (lambda (entry)
+                  (string-match-p "\\`\\(?:WHATSAPPEL_TOKEN\\|WUZAPI_TOKEN\\|SSLKEYLOGFILE\\|FFREPORT\\)=" entry))
+                process-environment))
+
+(defun whatsapp--private-directory ()
+  "Create an owned media job directory."
+  (let ((dir (make-temp-file "whatsappel-job-" t)))
+    (set-file-modes dir #o700)
+    dir))
+
+(defun whatsapp--private-write (directory bytes suffix)
+  "Write BYTES inside our DIRECTORY with a trusted SUFFIX and mode 0600."
+  (let ((file (expand-file-name (concat "media" suffix) directory))
+        (coding-system-for-write 'no-conversion))
+    (with-temp-file file (set-buffer-multibyte nil) (insert bytes))
+    (set-file-modes file #o600)
+    file))
+
+(defun whatsapp--mpv-command (file &optional loop)
+  "Build an mpv argument vector for owned local FILE, never a shell command."
+  (append (list whatsapp-media-player "--no-config" "--load-scripts=no" "--ytdl=no"
+                "--access-references=no" "--sub-auto=no" "--audio-file-auto=no"
+                "--demuxer-lavf-o=protocol_whitelist=file" "--keep-open=no"
+                "--force-window=yes" "--osc=yes")
+          (when loop '("--loop-file=inf")) (list "--" file)))
+
+(defun whatsapp--play-bytes (bytes mime &optional loop)
+  "Play an owned snapshot of BYTES in mpv; remove it when that player exits."
+  (unless (executable-find whatsapp-media-player)
+    (user-error "Install mpv and set whatsapp-media-player to its executable"))
+  (let* ((process-environment (whatsapp--media-environment))
+         (dir (whatsapp--private-directory))
+         (file (whatsapp--private-write dir bytes (whatsapp--media-suffix mime))) proc)
+    (condition-case err
+        (progn
+          (setq proc
+                (make-process
+                 :name "whatsappel-mpv" :buffer nil :noquery t :connection-type 'pipe
+                 :command (whatsapp--mpv-command file loop)
+                 :sentinel
+                 (lambda (process _event)
+                   (when (memq (process-status process) '(exit signal))
+                     (setq whatsapp--media-jobs (delq process whatsapp--media-jobs))
+                     (ignore-errors (delete-directory dir t))
+                     (when (/= (process-exit-status process) 0)
+                       (message "WhatsApp: mpv failed; verify the installed mpv version and file format"))))))
+          (push proc whatsapp--media-jobs)
+          proc)
+      (error (ignore-errors (delete-directory dir t)) (signal (car err) (cdr err))))))
+
+(defun whatsapp--stop-media-jobs ()
+  "Stop only mpv processes started by this Emacs instance."
+  (dolist (process (copy-sequence whatsapp--media-jobs))
+    (when (process-live-p process) (delete-process process))))
+(add-hook 'kill-emacs-hook #'whatsapp--stop-media-jobs)
+
+(defun whatsapp--view-render ()
+  "Render the current image with mouse-accessible zoom and save controls."
+  (let ((inhibit-read-only t) (bytes whatsapp--view-bytes) (type whatsapp--view-type))
+    (whatsapp--checked-image-pixels bytes type)
+    (erase-buffer)
+    (whatsapp--button "Fit" #'whatsapp-image-fit)
+    (whatsapp--button "−" #'whatsapp-image-smaller)
+    (whatsapp--button "+" #'whatsapp-image-larger)
+    (whatsapp--button "Save original…" #'whatsapp-image-save)
+    (whatsapp--button "Close" #'quit-window)
+    (insert "\n\n")
+    (let* ((dimensions (whatsapp--image-dimensions bytes type))
+           (width (if whatsapp--view-zoom
+                      (max 1 (round (* (car dimensions) whatsapp--view-zoom)))
+                    (max 1 (min (car dimensions) (- (window-pixel-width) 40)
+                                (floor (* (car dimensions)
+                                          (/ (float (max 1 (- (window-pixel-height) 120)))
+                                             (cdr dimensions)))))))))
+      (setq width (max 1 (min width 4096
+                             (floor (sqrt (* (min whatsapp-image-pixel-limit 16000000)
+                                             (/ (float (car dimensions)) (cdr dimensions))))))))
+      (insert-image (create-image bytes type t :width width :max-height 4096 :ascent 'center)))
+    (insert "\n") (goto-char (point-min)) (set-buffer-modified-p nil)))
+(defun whatsapp-image-fit () "Fit image to the selected window." (interactive)
+  (setq whatsapp--view-zoom nil) (whatsapp--view-render))
+(defun whatsapp-image-larger () "Increase image zoom, bounded at 400 percent." (interactive)
+  (setq whatsapp--view-zoom (min 4.0 (* 1.25 (or whatsapp--view-zoom 1.0))))
+  (whatsapp--view-render))
+(defun whatsapp-image-smaller () "Decrease image zoom, bounded at ten percent." (interactive)
+  (setq whatsapp--view-zoom (max 0.1 (/ (or whatsapp--view-zoom 1.0) 1.25)))
+  (whatsapp--view-render))
+(defun whatsapp-image-save (file)
+  "Save original image bytes to FILE without recompression."
+  (interactive (list (read-file-name "Save original: " nil nil nil
+                                      (concat "whatsapp" (whatsapp--media-suffix whatsapp--view-mime)))))
+  (when (file-remote-p file) (user-error "Choose a local destination"))
+  (when (or (not (file-exists-p file)) (yes-or-no-p "Replace the existing file? "))
+    (let ((coding-system-for-write 'no-conversion))
+      (write-region whatsapp--view-bytes nil file nil 'silent))
+    (message "WhatsApp: original saved")))
+
+(defun whatsapp--open-uri (uri &optional kind)
+  "Preview image URI or open audio/video with mpv; never execute a document."
+  (whatsapp--open-bytes (whatsapp--data-uri-bytes uri) (whatsapp--data-uri-mime uri) kind))
+
+(defun whatsapp--open-bytes (bytes mime &optional kind)
+  "Preview bounded local BYTES of MIME; never invoke a shell or document handler."
+  (when (> (string-bytes bytes) whatsapp-max-file-bytes) (user-error "Preview exceeds the byte limit"))
+  (let ((type (whatsapp--image-type-from-mime mime)))
+    (cond
+     ((and type (not (eq type 'gif)) (display-graphic-p) (image-type-available-p type))
+      (whatsapp--checked-image-pixels bytes type)
+      (let ((buffer (get-buffer-create "*WhatsApp image*")))
+        (with-current-buffer buffer
+          (special-mode)
+          (setq whatsapp--view-bytes bytes whatsapp--view-type type
+                whatsapp--view-mime mime whatsapp--view-zoom nil))
+        (pop-to-buffer buffer) (whatsapp--view-render)))
+     ((or (string-prefix-p "video/" mime) (string-prefix-p "audio/" mime)
+          (equal mime "image/gif"))
+      (whatsapp--play-bytes bytes mime (or (equal kind "gif") (equal mime "image/gif"))))
+     (t (user-error "No safe inline viewer; use Save original on the message")))))
+
+(defun whatsapp--worker (operation payload callback)
+  "Run OPERATION asynchronously with PAYLOAD on stdin, then invoke CALLBACK.
+Tokens never appear in process arguments or temporary files."
+  (let ((process-environment (whatsapp--media-environment))
+        (script (expand-file-name "scripts/media-worker.py" whatsapp--source-directory))
+        (python (executable-find whatsapp-python-program))
+        (output "") done timer proc)
+    (unless (and python (file-regular-p script))
+      (user-error "Install Python 3 and the complete WhatsAppel source directory"))
+    (cl-labels
+        ((finish (result)
+           (unless done
+             (setq done t)
+             (when timer (cancel-timer timer))
+             (funcall callback result))))
+      (setq proc
+            (make-process
+             :name "whatsappel-media-worker" :buffer nil :noquery t
+             :connection-type 'pipe :coding 'utf-8-unix
+             :command (list python "-I" script operation)
+             :filter (lambda (process text)
+                       (setq output (concat output text))
+                       (when (> (length output) 65536)
+                         (finish '(("ok") ("uncertain" . t) ("error" . "Worker output limit; check delivery before retrying")))
+                         (delete-process process)))
+             :sentinel
+             (lambda (process _event)
+               (when (memq (process-status process) '(exit signal))
+                 (finish
+                  (condition-case nil
+                      (let ((json-object-type 'alist) (json-array-type 'list)
+                            (json-key-type 'string) (json-false nil) (json-null nil))
+                        (let ((result (json-read-from-string output)))
+                          (unless (listp result) (error "Invalid worker response"))
+                          result))
+                    (error '(("ok") ("uncertain" . t)
+                             ("error" . "Worker stopped; check delivery before retrying")))))))))
+      (setq timer (run-at-time 130 nil
+                              (lambda ()
+                                (finish '(("ok") ("uncertain" . t)
+                                          ("error" . "Operation timed out; check delivery before retrying")))
+                                (when (process-live-p proc) (delete-process proc)))))
+      (condition-case err
+          (progn (process-send-string proc (concat (json-encode payload) "\n"))
+                 (process-send-eof proc))
+        (error (when (process-live-p proc) (delete-process proc))
+               (finish '(("ok") ("error" . "Could not start media operation")))
+               (message "WhatsApp: worker setup failed")))
+      proc)))
+
+(defun whatsapp--stage-render ()
+  "Render the explicit preview/send workflow for the pinned recipient."
+  (let ((inhibit-read-only t))
+    (erase-buffer)
+    (insert (propertize "Prepare attachment\n" 'face 'whatsapp-title))
+    (let ((transport (if whatsapp--stage-file
+                         (whatsapp--safe-media-kind (intern whatsapp--stage-kind)
+                                                    (whatsapp--guess-mime whatsapp--stage-file 'document))
+                       whatsapp--stage-kind)))
+      (insert (format "To: %s\nFile: %s\nSend as: %s\n\n"
+                      whatsapp--stage-target (or whatsapp--stage-file "Recording…") transport)))
+    (insert (format "Caption: %s\n\n" whatsapp--stage-caption))
+    (cond
+     ((and (not whatsapp--stage-operation) (not whatsapp--stage-file))
+      (whatsapp--button "Cancel" #'whatsapp-stage-cancel))
+     ((eq whatsapp--stage-operation 'recording)
+      (insert "Microphone active · recording stops automatically at the configured limit.\n\n")
+      (whatsapp--button "Stop recording" #'whatsapp-voice-stop)
+      (whatsapp--button "Discard" #'whatsapp-stage-cancel))
+     (whatsapp--stage-operation
+      (insert (format "%s in progress. Do not retry a send until its result is known.\n"
+                      whatsapp--stage-operation)))
+     (t
+      (whatsapp--button "Preview" #'whatsapp-stage-preview)
+      (whatsapp--button "Caption…" #'whatsapp-stage-caption)
+      (whatsapp--button "Send" #'whatsapp-stage-send)
+      (whatsapp--button "Cancel" #'whatsapp-stage-cancel)
+      (when (equal (downcase (or (and whatsapp--stage-file (file-name-extension whatsapp--stage-file)) "")) "gif")
+        (insert "\n\nRaw GIFs are sent unchanged as documents. Optional MP4 copy: up to 30 seconds.\n")
+        (whatsapp--button "Prepare MP4 copy" #'whatsapp-stage-convert-gif))))
+    (when whatsapp--stage-error
+      (insert (propertize (concat "\n\n" whatsapp--stage-error "\n") 'face 'warning)))
+    (insert "\n\nNo automatic send. Media uses the standard bridge transport, not a pqenv envelope.\n")
+    (goto-char (point-min)) (set-buffer-modified-p nil)))
+
+(defun whatsapp--stage-cleanup ()
+  "Remove only this stage's private generated files."
+  (dolist (directory whatsapp--stage-owned)
+    (ignore-errors (delete-directory directory t)))
+  (setq whatsapp--stage-owned nil))
+
+(defun whatsapp--stage-close-p ()
+  "Protect an in-flight operation against accidental buffer closure."
+  (if whatsapp--stage-operation
+      (progn (message "WhatsApp: use Stop/Discard for recording; an upload cannot be recalled by closing") nil)
+    t))
+
+(defun whatsapp--stage-create (kind file &optional caption)
+  "Create a mouse-first stage for KIND and FILE, pinning this chat and account."
+  (unless whatsapp-chat--target (user-error "Open a WhatsApp conversation first"))
+  (let ((target whatsapp-chat--target) (origin (current-buffer))
+        (buffer (generate-new-buffer "*WhatsApp attachment*")))
+    (with-current-buffer buffer
+      (special-mode)
+      (setq whatsapp--stage-target target whatsapp--stage-origin origin
+            whatsapp--stage-file file whatsapp--stage-kind (if (symbolp kind) (symbol-name kind) kind)
+            whatsapp--stage-caption (or caption "") whatsapp--stage-url whatsapp-bridge-url
+            whatsapp--stage-token-id (secure-hash 'sha256 (or whatsapp-bridge-token "")))
+      (add-hook 'kill-buffer-hook #'whatsapp--stage-cleanup nil t)
+      (add-hook 'kill-buffer-query-functions #'whatsapp--stage-close-p nil t)
+      (whatsapp--stage-render))
+    (pop-to-buffer buffer) buffer))
+
+(defun whatsapp-stage-caption (caption)
+  "Set attachment CAPTION before sending."
+  (interactive (list (read-string "Caption: " whatsapp--stage-caption)))
+  (when whatsapp--stage-operation (user-error "An operation is already in progress"))
+  (setq whatsapp--stage-caption caption) (whatsapp--stage-render))
+
+(defun whatsapp-stage-preview ()
+  "Preview the local file; do not upload anything."
+  (interactive)
+  (when whatsapp--stage-operation (user-error "An operation is already in progress"))
+  (unless whatsapp--stage-file (user-error "There is no recorded/selected file"))
+  (let* ((file whatsapp--stage-file) (mime (whatsapp--guess-mime file 'document)))
+    (whatsapp--validate-file file)
+    (let ((kind whatsapp--stage-kind)
+          (bytes (with-temp-buffer
+                   (set-buffer-multibyte nil)
+                   (insert-file-contents-literally file nil 0 (1+ whatsapp-max-file-bytes))
+                   (buffer-string))))
+      (whatsapp--open-bytes bytes mime kind))))
+
+(defun whatsapp-stage-send ()
+  "Send the staged attachment once to its pinned recipient, asynchronously."
+  (interactive)
+  (when whatsapp--stage-operation (user-error "An operation is already in progress"))
+  (unless (and (equal whatsapp--stage-url whatsapp-bridge-url)
+               (equal whatsapp--stage-token-id (secure-hash 'sha256 (or whatsapp-bridge-token ""))))
+    (user-error "Account changed; cancel and prepare the attachment again"))
+  (whatsapp--validate-bridge)
+  (whatsapp--validate-file whatsapp--stage-file)
+  (let ((buffer (current-buffer)) (origin whatsapp--stage-origin))
+    (setq whatsapp--stage-operation 'upload whatsapp--stage-error nil)
+    (whatsapp--stage-render)
+    (condition-case err
+        (setq whatsapp--stage-process
+              (whatsapp--worker
+               "send" `(("url" . ,whatsapp-bridge-url) ("token" . ,whatsapp-bridge-token)
+                        ("target" . ,whatsapp--stage-target) ("kind" . ,whatsapp--stage-kind)
+                        ("file" . ,whatsapp--stage-file) ("caption" . ,whatsapp--stage-caption)
+                        ("max_bytes" . ,(min (* 16 1024 1024) whatsapp-max-file-bytes))
+                        ("timeout" . ,(max 1 (min 120 whatsapp-request-timeout))))
+               (lambda (result)
+                 (when (buffer-live-p buffer)
+                   (with-current-buffer buffer
+                     (setq whatsapp--stage-operation nil whatsapp--stage-process nil)
+                     (if (eq t (cdr (assoc "ok" result)))
+                         (progn
+                           (when (buffer-live-p origin)
+                             (with-current-buffer origin (whatsapp-chat-refresh t)))
+                           (kill-buffer buffer)
+                           (message "WhatsApp: attachment accepted by the bridge"))
+                       (setq whatsapp--stage-error (or (cdr (assoc "error" result))
+                                                       "Delivery unconfirmed; check the chat before retrying"))
+                       (whatsapp--stage-render)))))))
+      (error (setq whatsapp--stage-operation nil whatsapp--stage-error (error-message-string err))
+             (whatsapp--stage-render)))))
+
+(defun whatsapp-stage-convert-gif ()
+  "Prepare an explicit bounded MP4 copy of the staged GIF; never auto-send."
+  (interactive)
+  (when whatsapp--stage-operation (user-error "An operation is already in progress"))
+  (let* ((buffer (current-buffer)) (dir (whatsapp--private-directory))
+         (output (expand-file-name "animation.mp4" dir)))
+    (push dir whatsapp--stage-owned)
+    (setq whatsapp--stage-operation 'conversion whatsapp--stage-error nil)
+    (whatsapp--stage-render)
+    (condition-case err
+        (setq whatsapp--stage-process
+              (whatsapp--worker
+               "gif" `(("file" . ,whatsapp--stage-file) ("output" . ,output))
+               (lambda (result)
+                 (when (buffer-live-p buffer)
+                   (with-current-buffer buffer
+                     (setq whatsapp--stage-operation nil whatsapp--stage-process nil)
+                     (if (eq t (cdr (assoc "ok" result)))
+                         (setq whatsapp--stage-file output whatsapp--stage-kind "gif"
+                               whatsapp--stage-error "MP4 copy prepared. Preview, then Send. Native GIF looping depends on your wuzapi build.")
+                       (setq whatsapp--stage-error (or (cdr (assoc "error" result)) "Conversion failed")))
+                     (whatsapp--stage-render))))))
+      (error (setq whatsapp--stage-operation nil whatsapp--stage-error (error-message-string err))
+             (whatsapp--stage-render)))))
+
+(defun whatsapp-stage-cancel ()
+  "Discard a recording or a prepared file; never recall an in-flight upload."
+  (interactive)
+  (when (and whatsapp--stage-operation (not (eq whatsapp--stage-operation 'recording)))
+    (user-error "An upload/conversion is in progress; closing cannot undo delivery"))
+  (when (and whatsapp--stage-process (process-live-p whatsapp--stage-process))
+    (set-process-sentinel whatsapp--stage-process #'ignore)
+    (delete-process whatsapp--stage-process))
+  (setq whatsapp--stage-operation nil)
+  (kill-buffer (current-buffer)))
+
+(defun whatsapp-voice-command (file)
+  "Return a shell-free FFmpeg command for a bounded, mono Opus recording."
+  (list "ffmpeg" "-hide_banner" "-loglevel" "error" "-n"
+        "-f" "pulse" "-i" whatsapp-voice-device "-ac" "1" "-ar" "48000"
+        "-c:a" "libopus" "-b:a" "32k" "-t" (number-to-string (max 1 (min 600 whatsapp-voice-seconds)))
+        "-fs" (number-to-string (min (* 16 1024 1024) whatsapp-max-file-bytes)) file))
+
+(defun whatsapp-chat-record-voice ()
+  "Start recording only after this explicit command; Stop, Preview, then Send."
+  (interactive)
+  (unless (executable-find "ffmpeg") (user-error "Install FFmpeg with PulseAudio input support"))
+  (unless whatsapp-chat--target (user-error "Open a WhatsApp conversation first"))
+  (let* ((process-environment (whatsapp--media-environment))
+         (dir (whatsapp--private-directory)) (file (expand-file-name "voice.ogg" dir))
+         (buffer (whatsapp--stage-create 'audio file)) timer)
+    (with-current-buffer buffer
+      (push dir whatsapp--stage-owned)
+      (setq whatsapp--stage-operation 'recording)
+      (condition-case err
+          (progn
+            (setq whatsapp--stage-process
+                  (make-process
+                   :name "whatsappel-recording" :buffer nil :noquery t :connection-type 'pipe
+                   :command (whatsapp-voice-command file)
+                   :sentinel
+                   (lambda (process _event)
+                     (when (memq (process-status process) '(exit signal))
+                       (when timer (cancel-timer timer))
+                       (when (buffer-live-p buffer)
+                         (with-current-buffer buffer
+                           (setq whatsapp--stage-operation nil whatsapp--stage-process nil)
+                           (if (and (= (process-exit-status process) 0) (file-regular-p file)
+                                    (> (file-attribute-size (file-attributes file)) 0))
+                               (progn (set-file-modes file #o600)
+                                      (setq whatsapp--stage-error "Recording ready. Preview before Send. This is Opus audio; a native voice-note badge is not guaranteed."))
+                             (setq whatsapp--stage-file nil
+                                   whatsapp--stage-error "Recording failed. Check microphone permission and the PulseAudio/PipeWire input; Cancel to retry."))
+                           (whatsapp--stage-render)))))))
+            (let ((process whatsapp--stage-process))
+              (setq timer (run-at-time (+ 10 (max 1 (min 600 whatsapp-voice-seconds))) nil
+                                       (lambda () (when (process-live-p process) (delete-process process)))))))
+        (error (setq whatsapp--stage-operation nil whatsapp--stage-file nil
+                     whatsapp--stage-error (error-message-string err))))
+      (whatsapp--stage-render))))
+
+(defun whatsapp-voice-stop ()
+  "Ask FFmpeg to finish the recording and flush its Ogg container."
+  (interactive)
+  (unless (and (eq whatsapp--stage-operation 'recording)
+               (process-live-p whatsapp--stage-process))
+    (user-error "No active recording"))
+  (setq whatsapp--stage-operation 'finishing-recording)
+  (process-send-string whatsapp--stage-process "q\n")
+  (whatsapp--stage-render))
+
+(defun whatsapp-root-click (event)
+  "Open the exact conversation clicked by mouse EVENT."
+  (interactive "e")
+  (mouse-set-point event) (whatsapp-root-open-chat))
+
+;;;###autoload
+(defun whatsapp-launch ()
+  "Open the mouse-first workspace using existing account settings.
+No account linking or microphone recording occurs automatically."
+  (interactive)
+  (setq whatsapp--workspace-active t)
+  (when (equal whatsapp-media-player "xdg-open") (setq whatsapp-media-player "mpv"))
+  (when-let ((origin (getenv "WHATSAPPEL_BRIDGE_URL"))) (setq whatsapp-bridge-url origin))
+  (unless whatsapp-bridge-token
+    (setq whatsapp-bridge-token (getenv "WHATSAPPEL_TOKEN")))
+  (whatsapp)
+  (unless whatsapp--poll-timer (whatsapp-toggle-polling))
+  (message "WhatsAppel: select a conversation; Connect / Show QR are available on the dashboard"))
 
 (provide 'whatsapp)
 ;;; whatsapp.el ends here

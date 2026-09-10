@@ -2,12 +2,12 @@
 
 <img src="assets/logo.png" alt="whatsappel" width="200">
 
-# WhatsAppel 3.1 — WhatsApp in Emacs
+# WhatsAppel 3.2.0-rc1 — WhatsApp in Emacs
 
 **Guile bridge · wuzapi engine · no Baileys · no JavaScript**
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-3.0.0-green.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-3.2.0--rc1-orange.svg)](CHANGELOG.md)
 [![Emacs](https://img.shields.io/badge/Emacs-%E2%89%A528-7F5AB6.svg)](https://www.gnu.org/software/emacs/)
 
 Official: [git.securityops.co/cristiancmoises/whatsappel](https://git.securityops.co/cristiancmoises/whatsappel)
@@ -17,14 +17,44 @@ Official: [git.securityops.co/cristiancmoises/whatsappel](https://git.securityop
 </div>
 
 A WhatsApp client for Emacs whose UI/UX follows telega.el. The former Node/Baileys
-backend is gone; every line here is **Guile Scheme** and **Emacs Lisp**. The
+backend remains **Guile Scheme**, with **Emacs Lisp** for the interface. A small
+**Python 3** worker handles asynchronous attachment uploads and explicit GIF
+conversion; Python also supports the update and publication tooling. The
 WhatsApp multi-device protocol itself is delegated to **wuzapi**
 (Go/[whatsmeow](https://github.com/tulir/whatsmeow)) over its local REST API —
 that protocol (Noise + the Signal double-ratchet + WhatsApp protobufs) has no Guile
 implementation and a hand-rolled one would be a homemade-crypto liability. No
 JavaScript anywhere.
 
-## 3.1 upgrade
+## 3.2.0-rc1 workspace update
+
+**Release candidate, not a completed production certification.** The recorded
+Python/loopback/media-fixture checks ran successfully. Native Emacs, Guile, fish,
+mpv and Rust checks were blocked in the build environment. The updater requires
+native changed-code gates to pass on the destination before replacing source.
+
+The workspace adds a desktop-menu launcher, a chat sidebar, visible Image / Video /
+GIF / Record voice / File buttons, and an explicit Preview → Send attachment stage.
+Text sends and upload workers are asynchronous. Draft edits made during a send
+are preserved. Conversations initially render 100 messages, with Show older to
+expand; preview caching and coalesced repaints reduce repeated work.
+
+Images have Fit, zoom and Save original controls. Audio/video opens in mpv from
+private local snapshots, removed when the player exits. Raw GIF files remain
+original documents unless you explicitly prepare a bounded MP4 copy. Voice capture
+uses FFmpeg and Opus audio; a native WhatsApp voice-note badge is not promised.
+
+- [3.2 user and deployment guide](docs/WORKSPACE-3.2.md) · [Guia em português](docs/WORKSPACE-3.2.pt-BR.md)
+- [3.2 audit and limitations](docs/AUDIT-3.2.0-rc1.md) · [Auditoria em português](docs/AUDIT-3.2.0-rc1.pt-BR.md)
+- [Executed implementation specification](docs/PROMPT-3.2.0-rc1.md)
+- [README em português brasileiro](README.pt-BR.md)
+
+The Guile bridge, wuzapi session and PQ identity files are not replaced by this
+update. The interface runs on the desktop: this is **not a browser application or
+a new service to expose through Nginx Proxy Manager**. Existing Org integration
+and the synchronous low-level media helper remain available.
+
+## Earlier 3.1 upgrade
 
 A native dashboard with clickable actions, chat filtering, a command palette and
 an explicit original-file attachment path makes everyday use easier. Background

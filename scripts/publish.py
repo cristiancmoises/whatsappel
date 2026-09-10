@@ -117,7 +117,10 @@ class Forge:
         if body is not None:
             headers["Content-Type"] = "application/json"
         req = request.Request(self.api + path, data=body, headers=headers, method=method)
-        opener = request.build_opener(NoRedirect(), request.HTTPSHandler(context=ssl.create_default_context()))
+        # Construct the context explicitly: SSLKEYLOGFILE must not enable token-bearing TLS session logs.
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.load_default_certs()
+        opener = request.build_opener(NoRedirect(), request.HTTPSHandler(context=context))
         try:
             with opener.open(req, timeout=self.timeout) as response:
                 payload = response.read(MAX_RESPONSE + 1)
