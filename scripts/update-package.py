@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Hash-anchored WhatsAppel client update; existing state and bridge are untouched.
+"""Hash-anchored WhatsAppel client/bridge update; configuration and sessions stay untouched.
 
 Default is check-only. --apply runs native changed-code gates in an isolated
 candidate BEFORE writing managed files. No force/bypass switch is provided.
@@ -15,9 +15,12 @@ import os
 from pathlib import Path, PurePosixPath
 import shutil
 import stat
+import re
 import subprocess
 import sys
 import tempfile
+import importlib.util
+import uuid
 
 
 class UpdateError(Exception):
@@ -25,10 +28,22 @@ class UpdateError(Exception):
 
 
 def digest(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    """Hash a regular, non-symlink file with fixed working memory."""
+    no_links(path)
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise UpdateError("Nonregular managed file refused")
+        result = hashlib.sha256()
+        block = bytearray(1024 * 1024)
+        while count := stream.readinto(block):
+            result.update(memoryview(block)[:count])
+        return result.hexdigest()
 
 
 def safe_relative(value):
+    if not isinstance(value, str):
+        raise UpdateError("Managed path must be text")
     p = PurePosixPath(value)
     if (not value or p.is_absolute() or any(x in {"", ".", "..", ".git"} for x in p.parts)
             or "\\" in value or any(ord(c) < 32 for c in value)
@@ -46,10 +61,18 @@ def no_links(path):
 def verify_bundle(bundle):
     no_links(bundle)
     manifest = bundle / "manifest.json"
+    for metadata in (manifest, bundle / "SHA256SUMS"):
+        no_links(metadata)
+        if not metadata.is_file() or metadata.stat().st_size > 4 * 1024 * 1024:
+            raise UpdateError("Missing or oversized bundle metadata")
     entries = (bundle / "SHA256SUMS").read_text().splitlines()
+    if not 1 <= len(entries) <= 4096:
+        raise UpdateError("Invalid checksum entry count")
     seen = set()
     for line in entries:
         expected, name = line.split("  ", 1)
+        if not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise UpdateError("Invalid checksum digest")
         rel = safe_relative(name)
         path = bundle / rel
         no_links(path)
@@ -59,23 +82,47 @@ def verify_bundle(bundle):
     if "manifest.json" not in seen:
         raise UpdateError("Manifest is not covered by bundle checksums")
     spec = json.loads(manifest.read_text())
-    if spec.get("format") != 1 or not isinstance(spec.get("files"), list):
+    if (not isinstance(spec, dict) or spec.get("format") != 1
+            or not isinstance(spec.get("files"), list) or not 1 <= len(spec["files"]) <= 1024
+            or not isinstance(spec.get("audit_inputs"), list)):
         raise UpdateError("Unsupported manifest")
     managed = set()
     for item in spec["files"]:
         rel = safe_relative(item["path"])
+        compatible_baselines(item)
+        if (type(item.get("mode", 0o644)) is not int
+                or item.get("mode", 0o644) not in {0o600, 0o644, 0o700, 0o755}
+                or not isinstance(item.get("after"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", item["after"])):
+            raise UpdateError("Unsafe payload permissions or digest")
         if item["path"] in managed or "payload/" + item["path"] not in seen:
             raise UpdateError("Duplicate or unchecked payload path")
         if digest(bundle / "payload" / rel) != item["after"]:
             raise UpdateError("Payload digest mismatch")
         managed.add(item["path"])
+    for value in spec["audit_inputs"]:
+        safe_relative(value)
     return spec
+
+
+def compatible_baselines(item):
+    """Only explicitly enumerated SHA-256 anchors, never fuzzy patch matching."""
+    extra = item.get("compatible_before", [])
+    if not isinstance(extra, list) or len(extra) > 16:
+        raise UpdateError("Invalid compatibility anchors")
+    values = [item.get("before"), *extra]
+    if any(value is not None and (not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value))
+           for value in values):
+        raise UpdateError("Invalid compatibility SHA-256")
+    if len(set(values)) != len(values):
+        raise UpdateError("Duplicate compatibility anchor")
+    return set(values)
 
 
 def preflight(target, bundle, spec):
     no_links(target)
     if not target.is_dir() or not (target / "whatsapp.el").is_file():
-        raise UpdateError("Existing WhatsAppel 3.1.0 source directory not found: " + str(target))
+        raise UpdateError("Existing WhatsAppel source directory not found: " + str(target))
     changes = []
     for item in spec["files"]:
         path = target / safe_relative(item["path"])
@@ -85,7 +132,7 @@ def preflight(target, bundle, spec):
         current = digest(path) if path.exists() else None
         if current == item["after"]:
             continue
-        if current != item.get("before"):
+        if current not in compatible_baselines(item):
             raise UpdateError("Unrecognized local changes: " + item["path"] + "; current SHA-256=" + str(current))
         changes.append(item)
     return changes
@@ -140,11 +187,15 @@ def restore_backup(backup):
     print("Restored managed files. Existing Emacs processes must be restarted to load restored code.")
 
 
-def apply_files(target, bundle, changes, backup, desktop=False):
+def apply_files(target, bundle, changes, backup, desktop=False, verified_payload=None):
     jobs = []
     for item in changes:
         path = target / item["path"]
-        jobs.append((path, (bundle / "payload" / item["path"]).read_bytes(), item.get("mode", 0o644)))
+        data = (verified_payload[item["path"]] if verified_payload is not None
+                else (bundle / "payload" / item["path"]).read_bytes())
+        if hashlib.sha256(data).hexdigest() != item["after"]:
+            raise UpdateError("Payload changed after verification")
+        jobs.append((path, data, item.get("mode", 0o644)))
         if path.suffix == ".el":
             compiled = path.with_suffix(".elc")
             no_links(compiled)
@@ -206,7 +257,67 @@ def stage_candidate(target, bundle, spec, candidate):
         shutil.copy2(bundle / "payload" / item["path"], p)
     for required in ("whatsapp-org.el", "tests/client-tests.el", "tests/whatsapp-org-tests.el", "scripts/publish.py", "scripts/apply-update.py"):
         if not (candidate / required).is_file():
-            raise UpdateError("Installation lacks audit input: " + required + "; use a complete 3.1.0 checkout")
+            raise UpdateError("Installation lacks audit input: " + required + "; use a complete supported checkout")
+
+
+
+def load_auditor(candidate):
+    spec = importlib.util.spec_from_file_location("whatsappel_candidate_audit", candidate / "scripts/audit-workspace.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def installed_inputs(target, spec):
+    """Capture unchanged audit inputs too, including independently newer PQ code."""
+    values = sorted(set(spec["audit_inputs"]) | {item["path"] for item in spec["files"]})
+    result = {}
+    for value in values:
+        path = target / safe_relative(value)
+        no_links(path)
+        if path.exists() and not path.is_file():
+            raise UpdateError("Nonregular audit input")
+        result[value] = digest(path) if path.exists() else None
+    return result
+
+
+def frozen_payload(candidate, spec):
+    """Take one immutable copy of the exact payload before executing tests."""
+    frozen = {}
+    for item in spec["files"]:
+        path = candidate / safe_relative(item["path"])
+        no_links(path)
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != item["after"]:
+            raise UpdateError("Staged payload does not match manifest")
+        frozen[item["path"]] = raw
+    return frozen
+
+
+def verify_double_audit(candidate, report_paths, run_ids, expected, scope, plan, fingerprint):
+    """Receipts prove consistency with these runs, not a third-party signature."""
+    if len(report_paths) != 2 or len(set(run_ids)) != 2 or not expected:
+        raise UpdateError("Two distinct complete audits are required")
+    for path, run_id in zip(report_paths, run_ids):
+        no_links(path)
+        if not path.is_file() or path.stat().st_size > 8 * 1024 * 1024:
+            raise UpdateError("Missing or oversized audit receipt")
+        report = json.loads(path.read_text())
+        if (not isinstance(report, dict) or report.get("schema") != 2 or report.get("run_id") != run_id
+                or report.get("source") != str(candidate) or report.get("scope") != scope
+                or report.get("passed") is not True
+                or report.get("source_sha256") != expected
+                or report.get("source_sha256_after") != expected):
+            raise UpdateError("Audit receipt does not match the exact candidate/scope")
+        checks = report.get("checks")
+        if (not isinstance(checks, list) or any(not isinstance(record, dict) for record in checks)
+                or [record.get("check") for record in checks] != plan):
+            raise UpdateError("Incomplete or duplicate audit gate set")
+        if any(record.get("status") != "PASS" or type(record.get("exit_code")) is not int
+               or record["exit_code"] != 0 for record in checks):
+            raise UpdateError("Failed, partial, or blocked audit gate")
+    if fingerprint(candidate) != expected:
+        raise UpdateError("Candidate code changed after audits")
 
 
 def main(argv=None):
@@ -214,6 +325,8 @@ def main(argv=None):
     p.add_argument("target", nargs="?", type=Path, default=Path.home() / "whatsappel")
     p.add_argument("--bundle", type=Path, default=Path(__file__).resolve().parents[1])
     p.add_argument("--apply", action="store_true")
+    p.add_argument("--audit-only", action="store_true", help="Assemble candidate and audit twice without installing")
+    p.add_argument("--full-audit", action="store_true", help="Include retained Rust tests, format and Clippy in each pass")
     p.add_argument("--desktop", action="store_true")
     p.add_argument("--rollback", type=Path)
     a = p.parse_args(argv)
@@ -222,38 +335,74 @@ def main(argv=None):
         return 0
     target, bundle = a.target.expanduser().absolute(), a.bundle.expanduser().absolute()
     spec = verify_bundle(bundle)
+    bundle_identity = digest(bundle / "SHA256SUMS")
     changes = preflight(target, bundle, spec)
-    print(f"Matched {spec['version']}: {len(changes)} managed file changes; configuration, bridge, pqenv and session files excluded.")
-    if not a.apply:
+    print(f"Matched {spec['version']}: {len(changes)} managed file changes; configuration, pqenv and sessions excluded.", flush=True)
+    if not (a.apply or a.audit_only):
         print("Check only. No installed files were changed.")
         return 0
-    # Serialize this installer without creating an untracked file in the repository.
     lock = target.parent / (".whatsappel-update-" + hashlib.sha256(str(target).encode()).hexdigest()[:16] + ".lock")
     no_links(lock)
-    with lock.open("a") as stream:
-        os.chmod(lock, 0o600)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0), 0o600)
+    with os.fdopen(fd, "r+") as stream:
+        st = os.fstat(stream.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.getuid():
+            raise UpdateError("Unsafe installer lock")
+        os.fchmod(stream.fileno(), 0o600)
         fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        preflight(target, bundle, spec)
+        target_identity = installed_inputs(target, spec)
         with tempfile.TemporaryDirectory(prefix="whatsappel-candidate-") as temporary:
             candidate = Path(temporary) / "source"
             stage_candidate(target, bundle, spec, candidate)
+            frozen = frozen_payload(candidate, spec)
+            auditor = load_auditor(candidate)
+            expected = auditor.source_fingerprint(candidate)
+            scope = "full" if a.full_audit else "changed"
+            plan = [name for name, _ in auditor.checks(candidate, scope)] + ["source-integrity"]
             stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
             reports = target.parent / ("whatsappel-audit-" + stamp)
-            result = subprocess.run([sys.executable, str(candidate / "scripts/audit-workspace.py"), str(candidate), "--scope", "changed", "--output", str(reports)])
-            if result.returncode:
-                raise UpdateError("Native changed-code audit failed or was blocked; installed files unchanged. Report: " + str(reports))
-        changes = preflight(target, bundle, spec)
-        backup = target.parent / ("whatsappel-backup-" + stamp)
-        apply_files(target, bundle, changes, backup, a.desktop)
-        print("Updated client source; no bridge/wuzapi restart or network change was needed.")
-        print("Backup: " + str(backup))
-        print("Rollback: python3 " + repr(str(backup / "rollback.py")) + " --rollback " + repr(str(backup)))
-        if a.desktop:
-            print("Launch from the application menu: WhatsAppel. Existing Emacs configuration is retained.")
+            no_links(reports)
+            reports.mkdir(mode=0o700, exist_ok=False)
+            codes, paths, run_ids = [], [], []
+            for pass_number in (1, 2):
+                output = reports / ("pass-" + str(pass_number))
+                run_id = uuid.uuid4().hex
+                result = subprocess.run([sys.executable, "-I", str(candidate / "scripts/audit-workspace.py"), str(candidate),
+                                         "--scope", scope, "--output", str(output), "--run-id", run_id],
+                                        env=auditor.clean_environment())
+                codes.append(result.returncode)
+                paths.append(output / "report.json")
+                run_ids.append(run_id)
+            if any(codes):
+                raise UpdateError("Native audit failed, was partial, or blocked in one or both passes; installed files unchanged. Reports: " + str(reports))
+            verify_double_audit(candidate, paths, run_ids, expected, scope, plan, auditor.source_fingerprint)
+            if verify_bundle(bundle) != spec or digest(bundle / "SHA256SUMS") != bundle_identity:
+                raise UpdateError("Bundle changed during audit; installed files unchanged")
+            # Check *all* payloads, including documentation not in code fingerprints.
+            if frozen_payload(candidate, spec) != frozen:
+                raise UpdateError("Candidate payload changed during audit")
+            if installed_inputs(target, spec) != target_identity:
+                raise UpdateError("Installed source/audit inputs changed during audit")
+            if a.audit_only:
+                print("Both exact-candidate audits passed. No installed files changed. Reports: " + str(reports))
+                return 0
+            changes = preflight(target, bundle, spec)
+            backup = target.parent / ("whatsappel-backup-" + stamp)
+            # Install the immutable bytes actually staged and audited, not the
+            # mutable download directory. This is not a sandbox against same-UID attackers.
+            apply_files(target, bundle, changes, backup, a.desktop, verified_payload=frozen)
+            print(f"Updated managed source. Restart Emacs AND the existing Guile bridge before testing {spec['version']}. Recipient delivery is not established by installation or provider acceptance. No service was restarted automatically.")
+            print("Backup: " + str(backup))
+            print("Rollback: python3 " + repr(str(backup / "rollback.py")) + " --rollback " + repr(str(backup)))
+            if a.desktop:
+                print("Launch from the application menu: WhatsAppel. Existing Emacs configuration is retained.")
     return 0
+
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (UpdateError, OSError, ValueError, KeyError) as exc:
+    except (UpdateError, OSError, ValueError, KeyError, TypeError) as exc:
         print("Stopped: " + str(exc), file=sys.stderr)
         raise SystemExit(1)

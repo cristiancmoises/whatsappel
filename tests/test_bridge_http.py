@@ -37,6 +37,7 @@ class MockWuzapi(ThreadingHTTPServer):
         self.responses = {}
         self.sequence = 0
         self.download_uri = ""
+        self.download_delay = 0
 
     def matching_requests(self, path):
         with self.lock:
@@ -85,6 +86,8 @@ class MockHandler(BaseHTTPRequestHandler):
             else:
                 # Empty contacts, groups and history keep startup sync local.
                 status, response = 200, {"success": True, "data": {}}
+        if self.path.startswith("/chat/download"):
+            time.sleep(self.server.download_delay)
         encoded = json.dumps(response, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")

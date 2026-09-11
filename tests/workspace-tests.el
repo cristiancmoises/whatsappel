@@ -12,6 +12,13 @@
        (whatsapp-chat--render nil)
        ,@body)))
 
+(defun whatsapp-workspace-test-button (command)
+  "Find COMMAND's button without coupling behavior tests to visible wording."
+  (let ((button (next-button (point-min) t)))
+    (while (and button (not (eq (button-get button 'whatsapp-command) command)))
+      (setq button (next-button (button-end button) t)))
+    button))
+
 (ert-deftest whatsapp-workspace-async-send-guards-duplicates ()
   (whatsapp-workspace-test-chat
    (insert "hello")
@@ -23,7 +30,7 @@
        (should whatsapp-chat--send-pending)
        (should-error (whatsapp-chat-send-input) :type 'user-error)
        (should (= calls 1))
-       (funcall callback '(200 ("wuzapi_status" . 200)))
+       (funcall callback '(200 ("wuzapi_status" . 200) ("data" ("success" . t) ("data" ("Id" . "fixture-id")))))
        (should-not whatsapp-chat--send-pending)
        (should (equal "" (whatsapp-chat--current-input)))))))
 
@@ -36,7 +43,7 @@
                ((symbol-function 'whatsapp-chat-refresh) #'ignore))
        (whatsapp-chat-send-input)
        (insert " newer")
-       (funcall callback '(200 ("wuzapi_status" . 200)))
+       (funcall callback '(200 ("wuzapi_status" . 200) ("data" ("success" . t) ("data" ("Id" . "fixture-id")))))
        (should (equal "hello newer" (whatsapp-chat--current-input)))))))
 
 (ert-deftest whatsapp-workspace-send-failure-retains-draft-and-reply ()
@@ -51,7 +58,7 @@
      (should (equal "do not lose" (whatsapp-chat--current-input))))))
 
 (ert-deftest whatsapp-workspace-send-needs-upstream-confirmation ()
-  (should (whatsapp--send-accepted-p '(200 ("wuzapi_status" . 201))))
+  (should (whatsapp--send-accepted-p '(200 ("wuzapi_status" . 201) ("data" ("success" . t) ("data" ("Id" . "fixture-id"))))))
   (dolist (value '((200) (200 . :invalid-json) (200 ("wuzapi_status" . 500)) (503)))
     (should-not (whatsapp--send-accepted-p value))))
 
@@ -64,9 +71,16 @@
      (insert "retained draft")
      (whatsapp-chat--render messages)
      (should-not (string-match-p "HIDDEN-OLDEST" (buffer-string)))
-     (should (string-match-p "Show older" (buffer-string)))
-     (whatsapp-chat-show-older)
+     ;; Exercise the real UI action, rather than the obsolete RC1 label.
+     (let ((button (whatsapp-workspace-test-button #'whatsapp-chat-show-older)))
+       (should button)
+       (should (button-get button 'follow-link))
+       (cl-letf (((symbol-function 'whatsapp--request-async)
+                  (lambda (&rest _) (ert-fail "Cached expansion requested network"))))
+         (button-activate button)))
+     (should (= whatsapp-chat--history-limit 4))
      (should (string-match-p "HIDDEN-OLDEST" (buffer-string)))
+     (should-not (whatsapp-workspace-test-button #'whatsapp-chat-show-older))
      (should (equal "retained draft" (whatsapp-chat--current-input))))))
 
 (ert-deftest whatsapp-workspace-account-scoped-cache ()

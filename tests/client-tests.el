@@ -144,7 +144,7 @@
               ((symbol-function 'run-at-time)
                (lambda (_seconds _repeat cb &rest _) (setq timeout cb) 'test-timer))
               ((symbol-function 'cancel-timer) #'ignore))
-      (whatsapp--request-async "GET" "/chats" nil
+      (whatsapp--url-request-async "GET" "/chats" nil
                                (lambda (result) (cl-incf calls) (should (= 200 (car result)))))
       (with-current-buffer request-buffer
         (insert "HTTP/1.1 200 OK\r\n\r\n[]")
@@ -160,7 +160,7 @@
               ((symbol-function 'run-at-time)
                (lambda (_seconds _repeat cb &rest _) (setq timeout cb) 'test-timer))
               ((symbol-function 'cancel-timer) #'ignore))
-      (whatsapp--request-async "GET" "/chats" nil (lambda (r) (setq result r)))
+      (whatsapp--url-request-async "GET" "/chats" nil (lambda (r) (setq result r)))
       (funcall timeout)
       (should-not (car result))
       (should-not (buffer-live-p request-buffer)))))
@@ -205,9 +205,15 @@
     (unwind-protect
         (progn
           (dolist (b (list hidden visible)) (with-current-buffer b (whatsapp-chat-mode)))
-          (cl-letf (((symbol-function 'buffer-list) (lambda () (list hidden visible)))
-                    ((symbol-function 'get-buffer-window) (lambda (b &rest _) (eq b visible)))
-                    ((symbol-function 'whatsapp-chat-refresh) (lambda (&rest _) (cl-incf calls))))
+          ;; Discover visible windows directly; unrelated buffers are not scanned.
+          (cl-letf (((symbol-function 'frame-list) (lambda () '(fixture-frame)))
+                    ((symbol-function 'frame-visible-p) (lambda (_) t))
+                    ((symbol-function 'window-list) (lambda (&rest _) '(fixture-window)))
+                    ((symbol-function 'window-buffer) (lambda (_) visible))
+                    ((symbol-function 'whatsapp-chat-refresh)
+                     (lambda (&rest _)
+                       (when (eq (current-buffer) visible) (cl-incf calls))
+                       (when (eq (current-buffer) hidden) (setq calls -100)))))
             (whatsapp--poll)
             (should (= calls 1))))
       (kill-buffer hidden) (kill-buffer visible))))
@@ -245,7 +251,8 @@
          (whatsapp--media-pending (make-hash-table :test 'equal))
          (whatsapp--media-queue nil) (whatsapp--media-active 0)
          (whatsapp--media-pump-timer nil) callbacks (calls 0))
-     (cl-letf (((symbol-function 'run-at-time) (lambda (&rest _) 'test-timer))
+     (cl-letf (((symbol-function 'get-buffer-window) (lambda (&rest _) (selected-window)))
+              ((symbol-function 'run-at-time) (lambda (&rest _) 'test-timer))
                ((symbol-function 'whatsapp--request-async)
                 (lambda (_method _path _payload callback)
                   (cl-incf calls) (setq callbacks (append callbacks (list callback))))))

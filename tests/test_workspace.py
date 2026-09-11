@@ -101,7 +101,7 @@ class WorkerTests(unittest.TestCase):
 
     def test_success_requires_upstream_confirmation(self):
         opener = mock.Mock()
-        opener.open.return_value = Reply(b'{"wuzapi_status":200,"data":{"success":true}}')
+        opener.open.return_value = Reply(b'{"wuzapi_status":200,"data":{"success":true,"data":{"Id":"fixture-id"}}}')
         self.assertTrue(worker.upload(self.spec, opener)["ok"])
         req = opener.open.call_args.args[0]
         self.assertEqual(req.full_url, "http://127.0.0.1:7337/send/image")
@@ -272,7 +272,14 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual((self.target / "whatsapp.el").read_bytes(), b"later edits")
 
     def test_failed_audit_keeps_installed_source_unchanged(self):
-        with mock.patch.object(installer, "stage_candidate"), mock.patch.object(installer.subprocess, "run", return_value=subprocess.CompletedProcess([], 1)):
+        def stage_fixture(target, bundle, spec, candidate):
+            # Only the failed exit is mocked; prepare actual candidate bytes so
+            # stronger pre-audit integrity checks are exercised too.
+            candidate.mkdir()
+            (candidate / "whatsapp.el").write_bytes((bundle / "payload/whatsapp.el").read_bytes())
+            (candidate / "scripts").mkdir()
+            (candidate / "scripts/audit-workspace.py").write_bytes((ROOT / "scripts/audit-workspace.py").read_bytes())
+        with mock.patch.object(installer, "stage_candidate", side_effect=stage_fixture), mock.patch.object(installer.subprocess, "run", return_value=subprocess.CompletedProcess([], 1)):
             with self.assertRaises(installer.UpdateError):
                 installer.main([str(self.target), "--bundle", str(self.bundle), "--apply"])
         self.assertEqual((self.target / "whatsapp.el").read_bytes(), b"old source")
@@ -296,7 +303,7 @@ class LauncherTests(unittest.TestCase):
             path = Path(td) / ".env"
             path.write_text('export WHATSAPPEL_TOKEN="test-only-token"\nexport WHATSAPPEL_PUBLIC_URL="http://127.0.0.1:7337"\nexport UNRELATED="ignored"\n')
             path.chmod(0o600)
-            self.assertEqual(launcher.literal_environment(path), {"WHATSAPPEL_TOKEN": "test-only-token", "WHATSAPPEL_BRIDGE_URL": "http://127.0.0.1:7337"})
+            self.assertEqual(launcher.literal_environment(path), {"WHATSAPPEL_TOKEN": "test-only-token", "WHATSAPPEL_PUBLIC_URL": "http://127.0.0.1:7337"})
             path.write_text('WHATSAPPEL_TOKEN="$(touch attacker-output)"\n')
             with self.assertRaises(ValueError):
                 launcher.literal_environment(path)

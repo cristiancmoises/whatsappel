@@ -36,7 +36,7 @@ class LoopbackTests(unittest.TestCase):
         self.file = self.root / "original.png"
         self.file.write_bytes(b"unchanged fixture bytes")
         self.calls = []
-        self.response = b'{"wuzapi_status":200,"data":{"success":true}}'
+        self.response = b'{"wuzapi_status":200,"data":{"success":true,"data":{"Id":"fixture-id"}}}'
         self.code = 200
         outer = self
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -161,11 +161,14 @@ class GitPublicationTests(unittest.TestCase):
             git("init", "-b", "main")
             git("config", "user.name", "Fixture Author")
             git("config", "user.email", "fixture@example.invalid")
-            files = ["whatsapp.el", "whatsapp-org.el", "tests/client-tests.el", "tests/whatsapp-org-tests.el", "scripts/publish.py", "scripts/apply-update.py"]
+            files = ["whatsapp.el", "whatsapp-org.el", "tests/client-tests.el", "tests/whatsapp-org-tests.el", "scripts/publish.py", "scripts/apply-update.py", "scripts/audit-workspace.py"]
             for name in files:
                 path = source / name
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("fixture-before\n")
+                if name == "scripts/audit-workspace.py":
+                    path.write_bytes((ROOT / name).read_bytes())
+                else:
+                    path.write_text("fixture-before\n")
             git("add", ".")
             git("commit", "-m", "fixture baseline")
             original_head = git("rev-parse", "HEAD").stdout
@@ -182,8 +185,25 @@ class GitPublicationTests(unittest.TestCase):
             (bundle / "SHA256SUMS").write_text("\n".join(update.digest(bundle / p) + "  " + p for p in checked) + "\n")
             real_run = subprocess.run
             def intercept(command, **kwargs):
-                # Deliberately mocked native gate: this test covers Git isolation, not Emacs correctness.
-                if len(command) > 1 and str(command[1]).endswith("/scripts/audit-workspace.py"):
+                # Deliberately synthetic audit receipts: this fixture tests Git
+                # isolation ONLY, never native Emacs/Guile correctness. The actual
+                # installer has no way to enable this test-only interception.
+                index = next((i for i, arg in enumerate(command)
+                              if str(arg).endswith("/scripts/audit-workspace.py")), None)
+                if index is not None:
+                    candidate = Path(command[index + 1])
+                    output = Path(command[command.index("--output") + 1])
+                    scope = command[command.index("--scope") + 1]
+                    run_id = command[command.index("--run-id") + 1]
+                    auditor = update.load_auditor(candidate)
+                    hashes = auditor.source_fingerprint(candidate)
+                    names = [name for name, _ in auditor.checks(candidate, scope)] + ["source-integrity"]
+                    output.mkdir(mode=0o700)
+                    (output / "report.json").write_text(json.dumps({
+                        "schema": 2, "run_id": run_id, "source": str(candidate),
+                        "scope": scope, "passed": True, "source_sha256": hashes,
+                        "source_sha256_after": hashes,
+                        "checks": [{"check": name, "status": "PASS", "exit_code": 0} for name in names]}))
                     return subprocess.CompletedProcess(command, 0)
                 return real_run(command, **kwargs)
             publication = root / "publication"

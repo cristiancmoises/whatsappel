@@ -1,5 +1,190 @@
 # Changelog
 
+## 3.2.0-rc17 — README / documentation refresh
+
+- Reworked English and PT-BR README files around the current native Emacs workflow.
+- Added all five user-supplied application screenshots to the public documentation.
+- Preserved three screenshots byte-for-byte; cropped only the bottom modeline/footer from two conversation screenshots as explicitly requested.
+- Added screenshot provenance notes and four-forge publication tooling.
+- Application behavior remains RC17; this documentation refresh does not claim new delivery, profile, presence, Pale, or security behavior.
+
+# 3.2.0-rc17 — focused send-failure guard
+
+- Check that a failed response body is a proper list before reading its error field.
+- Handle invalid-JSON and transport sentinels as unconfirmed outcomes, not callback exceptions.
+- Keep the original send-failure, late-account, draft/reply and recipient tests unchanged.
+- Add ten native regressions for immediate/deferred failures, newer edits, reply/undo
+  preservation, allowlisted/redacted errors, callback ownership, no resend and valid acceptance.
+- Preserve the verified-send route, recipient checks, bridge implementation, photos,
+  line-cleanup behavior and two-full-audit activation gate. No live delivery claim.
+
+# 3.2.0-rc16 — 2026-09-10
+
+- Require recipient-contract acknowledgement on normal text sends, without retry.
+- Classify provider failures with bounded, redacted local messages.
+- Retain explicit own history rows with no embedded message metadata.
+- Preserve profile-worker failure categories on unsuccessful exits; selected retry.
+- Correct About phone JIDs, preserve LIDs, keep CDN/decoder limits.
+- Remove current-buffer global hl-line overlay and explicit row-face decorations.
+- Add worker/HTTP, Guile, ERT regressions; retain mandatory double native gate.
+- No live delivery, native Pale integration, or measured UI speedup claimed.
+
+# 3.2.0-rc15 — verified activation and accepted-send recovery
+
+- Preserve accepted status if starting its history refresh raises an exception;
+  retain newer drafts, account warnings, provider IDs and no automatic resend.
+- Add optional, strictly verified local Shepherd activation after two full audits
+  and post-install payload checks; read-only status mode and private phase report.
+- Probe live transport independent of health advertisement; conflicting versions
+  cannot confirm activation. Registration remains distinct from delivery.
+- Add real Python process/HTTP/filesystem/socket tests and four native ERT cases.
+- Keep existing init, local sessions, older failure tests and cumulative anchors.
+  No new Pale binding, GUI performance result or live delivery claim.
+
+# RC14 — 2026-09-10
+
+- Restore the visible error state for a late send response after an account or
+  conversation change; keep the original draft and mark the attempt unconfirmed.
+- Preserve the original failing RC3 ERT case unchanged; add six native regressions
+  for changed tokens/URLs, draft/reply/undo preservation, duplicate responses,
+  callback-buffer ownership, no resend, and normal-account acceptance.
+- Keep LID targeting, local notes, line cleanup, strict acceptance and the original
+  two-full-audit installer gate. No provider, profile or cryptographic behavior change.
+- Restart the existing service only after a successful install and hash verification
+  in the supplied command. Failed audits must not trigger a service restart.
+
+# RC13 — 2026-09-10
+
+- Keep @lid recipient identities intact and recompute the selected text target.
+- Add one bounded, account-scoped local send-note overlay with strict acceptance,
+  provider-ID reconciliation and explicit uncertain-outcome dismissal.
+- Suppress app-local decorative underline/overline/box/hl-line styles and wrap actions.
+- Correct the retained ERT mock for the RC11 /send worker payload contract.
+- Add native identity/outbox/UI and bridge receipt/storage regressions plus real
+  worker HTTP namespace tests. Native/live results remain separately reported.
+- Use unique RC13 artifacts based on RC11; do not overwrite incomplete RC12 work.
+
+# 3.2.0-rc11 — transport and delivery candidate
+
+- Require unambiguous upstream message IDs; no automatic resend on uncertainty.
+- Parse direct/form/JSON jsonData and binary multipart metadata; reject duplicates.
+- Preserve ordinary ephemeral/document-caption media without unwrapping view-once.
+- Add redacted read-only connection check and explicitly confirmed callback repair.
+- Preserve webhook subscriptions; receipt labels do not invent recipient delivery.
+- Retry failed visible images explicitly; add bounded native GIF viewer.
+- Separate client origins from provider callback URLs in launcher and diagnostics.
+- Pale preference is present but native Pale playback remains unavailable; mpv is
+  explicit only. No claim of completed Pale integration or live acceptance.
+- Add subprocess/loopback Python tests, Guile HTTP tests, ERT cases and audit gate.
+
+# 3.2.0-rc10 — 2026-09-10
+
+- Fix profile validation before cache filtering: invalid groups/events no longer
+  receive HTTP 200 merely because the contact has not been cached.
+- Preserve valid unknown-event suppression, group photos and existing message state.
+- Keep the failing RC9 assertion and add 12 native regression methods.
+- Print bounded Python failure identifiers; add 10 diagnostic safety tests.
+- Retain guarded cumulative Guix update and four-remote publication workflows.
+- Native and live release status is documented in AUDIT-3.2.0-rc10.md.
+
+# 3.2.0-rc9 — profile workspace candidate (2026-09-10)
+
+- Add scoped native cyan/current-theme faces, reserved avatar gutter, contact-info
+  and settings panels, font controls, emoji insertion and redacted diagnostics.
+- Add a dedicated bounded profile worker: authenticated job submission, exact-host
+  HTTPS photo fetching with vetted DNS pinning, limited FFmpeg thumbnails and no
+  credential forwarding or redirects. Photos and metadata remain memory-only.
+- Add authenticated profile snapshots, two-worker metadata jobs, opt-in presence
+  subscription, typed observed Presence/ChatPresence/Picture handling, epoch and
+  picture-revision invalidation. Keep transcript revisions and unread state separate.
+- Preserve RC8 compose-first contact selection, explicit async decryption, drafts,
+  original media and existing two-pass guarded update/rollback/publication flow.
+- Native tests and screenshots are supplied but not asserted executed where tools
+  are absent. No remote Idle inference, stories, self-online announcement, provider
+  configuration changes, live deployment or new cryptographic guarantee.
+
+# 3.2.0-rc8 — contact selection (2026-09-10)
+
+Composer-first deferred refresh; bounded original-preserving text previews; no new image decoding or synchronous PQ in transcript insertion; scoped asynchronous explicit decryption; wall-clock scroll scheduling and content-free loaded-client diagnostics. Native/live acceptance remains required.
+
+## 3.2.0-rc7 — 2026-09-10
+
+- Fix mixed-source launcher account selection: external URL and token are chosen as a pair.
+- Add one-command existing-source Guix updates with two full audits and desktop registration.
+- Add explicit complete-source fresh installation with audited, atomic no-replace publication.
+- Add a commit-baseline check, full-scope publication audits and a retry-only four-remote command.
+- Replace stale README release layers with current English/Portuguese guides; archive history.
+- Preserve RC6 history-button/SRFI-64 fixes, worker bounds, no-resend rules and local state.
+- Candidate: native and live acceptance remains distinct from local Python/transaction tests.
+
+# 3.2.0-rc6 — 2026-09-10
+
+- Fix obsolete history-button assertion by activating the real button.
+- Correct named SRFI-64 test-error form; extend configuration boundary coverage.
+- Enumerate visible windows instead of scanning all Emacs buffers for polling.
+- Keep per-buffer backoff and isolate synchronous refresh exceptions.
+- Require private bounded descriptor-based launcher configuration reads.
+- Print native failed-test IDs; summarize audits without rerunning them.
+- Retain two-pass installation and cumulative content anchors.
+- No bridge/wuzapi/PQ implementation changes or production writes.
+
+# 3.2.0-rc5 — 2026-09-10
+
+- Share bounded strict JSON/deadline primitives across read and upload workers.
+  Reject ambiguous duplicate acknowledgements, nonfinite numbers and lone Unicode
+  surrogates; keep valid scalar Unicode and original-media handling intact.
+- Bound upload POST/reply wall time on the owned POSIX main-thread worker; a lost
+  or malformed acknowledgement remains uncertain, with no automatic resend.
+- Forward only fully validated raw read JSON into the worker envelope, avoiding
+  a second serialization. Stream SHA-256 inputs in fixed-size blocks. Isolated
+  microbenchmarks do not measure complete WhatsApp loading or delivery.
+- Record unittest successes/skips/errors directly. Empty, incomplete or conflicting
+  receipts cannot pass. Bound audit logs and runtime; clean up owned POSIX groups.
+- Require distinct full receipts, exact gate sets and unchanged pre/post code hashes
+  for installation. Recheck source/bundle/documents after both passes; install
+  immutable candidate bytes rather than rereading a mutable download directory.
+- Add protocol, real process/HTTP, receipt/transaction and audit regressions.
+  Keep native tests mandatory and preserve configuration, sessions and PQ source.
+
+# 3.2.0-rc4 — 2026-09-10
+
+- Adaptive bounded JSON depth scan with measured plain-span improvements and an
+  escape-dense fallback; strict exponent-overflow and query-escape rejection.
+- Unread-count changes update the root summary and affected rows, not the full
+  stable list. Off-page changes do not reconstruct visible rows.
+- Cache-only annotated conversation switcher; compact/detailed density control;
+  Direct (non-group) filter; corrected client version constant.
+- Added Python/HTTP, ERT and reproducible before/after JSON benchmark coverage.
+  Cumulative 3.1/RC1/RC2/RC3 anchors; native/live acceptance remains a release gate.
+
+## 3.2.0-rc3 — 2026-09-09
+
+- Read-only Python subprocess transport with response/framing/JSON limits and
+  POSIX total read deadline; string-keyed native Emacs JSON parsing when available.
+- Changed-row root updates, focus-aware read acknowledgements, explicit loading
+  states, automatic polling that honors pause, and Write draft shortcut.
+- Viewport-only idle prefetch, shared queued media-open intent, correct originating
+  buffer for media-job polls, cache-eviction retry eligibility and stale-send guard.
+- Cumulative exact 3.1/RC1/RC2 compatibility anchors with two mandatory native
+  validation passes; audit now rejects source mutations during each run.
+- Added real HTTP/subprocess, installer/controller and native ERT regressions.
+  See the RC3 audit for executed versus blocked results; no production guarantee.
+
+## 3.2.0-rc2 — candidate, 2026-09-09
+
+- Add authenticated v2 conditional chat/list snapshots and bounded recent-history windows.
+- Move v2 preview/open downloads into two bounded worker/result slots; keep legacy routes.
+- Cache summaries, serialize outside the store mutex and index client chat names.
+- Render compact two-line conversation rows, 80 initially; preserve full-cache search.
+- Splice changed transcript tails and sliding windows; update images without text erasure.
+- Add unread navigation, context actions, guarded quick launch and read-only latency doctor.
+- Add 20 ERT cases, 10 native bridge HTTP cases and 18 executable Python cases.
+- Require two native changed-code audit passes, including Guile, before installation.
+- Preserve configuration, sessions and pqenv; bridge restart is required to activate v2.
+- Validation remains incomplete: native runtimes were unavailable. No production claim.
+
+# Changelog
+
 All notable changes to WhatsApp.el are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 

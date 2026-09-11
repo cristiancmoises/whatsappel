@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -17,6 +18,15 @@ import ssl
 import subprocess
 import sys
 from urllib import error, parse, request
+
+# -I intentionally omits the working directory from imports. Load only the
+# helper next to this installed script, never an import from the user's cwd.
+import importlib.util
+from pathlib import Path
+_protocol_spec = importlib.util.spec_from_file_location(
+    "whatsappel_bridge_protocol", Path(__file__).resolve().with_name("bridge_protocol.py"))
+protocol = importlib.util.module_from_spec(_protocol_spec)
+_protocol_spec.loader.exec_module(protocol)
 
 MAX_BYTES = 16 * 1024 * 1024
 MAX_CONTROL = 131072
@@ -42,15 +52,16 @@ class NoRedirect(request.HTTPRedirectHandler):
         raise WorkerError("The bridge redirected the request; credentials were not forwarded.")
 
 def bridge_url(value):
-    if not isinstance(value, str) or any(ord(c) < 32 for c in value):
+    if not isinstance(value, str) or len(value) > 2048 or any(ord(c) < 33 or ord(c) == 127 for c in value):
         raise WorkerError("Invalid bridge URL.")
     try:
         url = parse.urlsplit(value)
-        _ = url.port
+        port = url.port
     except ValueError as exc:
         raise WorkerError("Invalid bridge URL.") from exc
-    if (url.scheme not in {"http", "https"} or not url.hostname or url.username
-            or url.password or url.query or url.fragment or url.path not in {"", "/"}):
+    if (url.scheme not in {"http", "https"} or not url.hostname or url.username is not None
+            or url.password is not None or url.query or url.fragment or url.path not in {"", "/"}
+            or "?" in value or "#" in value or (port is not None and not 1 <= port <= 65535)):
         raise WorkerError("Use a bridge origin without credentials, path, query or fragment.")
     if url.scheme == "http" and url.hostname not in {"localhost", "127.0.0.1", "::1"}:
         raise WorkerError("Plain HTTP is allowed only on loopback; use HTTPS or an SSH tunnel.")
@@ -108,10 +119,10 @@ def media_payload(spec):
 def upload(spec, opener=None):
     origin = bridge_url(spec.get("url"))
     token = spec.get("token")
-    if not isinstance(token, str) or not token or any(ord(c) < 32 or ord(c) > 126 for c in token):
+    if not isinstance(token, str) or not 1 <= len(token) <= 4096 or any(not 33 <= ord(c) <= 126 for c in token):
         raise WorkerError("Set a valid bridge token in Emacs.")
     timeout = spec.get("timeout", 45)
-    if type(timeout) not in {int, float} or not 1 <= timeout <= 120:
+    if type(timeout) not in {int, float} or not math.isfinite(timeout) or not 1 <= timeout <= 120:
         raise WorkerError("Invalid upload timeout.")
     transport, payload = media_payload(spec)
     req = request.Request(origin + "/send/" + transport,
@@ -122,24 +133,28 @@ def upload(spec, opener=None):
         context.load_default_certs()
         opener = request.build_opener(request.ProxyHandler({}), NoRedirect(), request.HTTPSHandler(context=context))
     try:
-        with opener.open(req, timeout=timeout) as reply:
+        # A socket timeout alone can be prolonged by a slow-drip response.
+        # One POST only: a deadline or bad acknowledgement means unknown delivery.
+        with protocol.overall_deadline(timeout), opener.open(req, timeout=timeout) as reply:
             raw = reply.read(MAX_RESPONSE + 1)
             if len(raw) > MAX_RESPONSE:
                 return {"ok": False, "uncertain": True, "error": "Oversized reply. Check the chat before retrying."}
-            obj = json.loads(raw) if raw else {}
+            obj = protocol.decode_json(raw) if raw else {}
             if not isinstance(obj, dict) or obj.get("success") is False:
                 return {"ok": False, "uncertain": True, "error": "Unconfirmed delivery. Check the chat before retrying."}
-            upstream = obj.get("wuzapi_status")
-            if type(upstream) is not int or not 200 <= upstream < 300:
+            message_id = protocol.accepted_message_id(obj)
+            if message_id is None:
                 return {"ok": False, "uncertain": True,
                         "error": "No upstream confirmation. Check the chat before retrying."}
-            return {"ok": 200 <= reply.status < 300, "status": reply.status, "transport": transport}
+            return {"ok": 200 <= reply.status < 300, "status": reply.status, "transport": transport,
+                    "message_id": message_id, "delivery": "accepted"}
     except error.HTTPError as exc:
         code = exc.code
         exc.close()
         return {"ok": False, "status": code, "uncertain": code >= 500,
                 "error": "Bridge rejected the request. For server errors, check the chat before retrying."}
-    except (error.URLError, TimeoutError, OSError, ValueError) as exc:
+    except (protocol.ProtocolError, WorkerError, error.URLError, TimeoutError,
+            OSError, ValueError, RecursionError) as exc:
         return {"ok": False, "uncertain": True,
                 "error": "Delivery is unknown after a connection/response error. Check the chat before retrying."}
 
@@ -211,11 +226,11 @@ def main(argv=None):
         raw = sys.stdin.buffer.read(MAX_CONTROL + 1)
         if len(raw) > MAX_CONTROL:
             raise WorkerError("Media control request is too large.")
-        spec = json.loads(raw)
+        spec = protocol.decode_json(raw)
         if not isinstance(spec, dict):
             raise WorkerError("Invalid media request.")
         result = upload(spec) if args.operation == "send" else convert_gif(spec)
-    except WorkerError as exc:
+    except (WorkerError, protocol.ProtocolError) as exc:
         result = {"ok": False, "error": str(exc)}
     except Exception:
         result = {"ok": False, "error": "Media operation failed; no automatic retry was attempted."}

@@ -149,7 +149,7 @@ been decrypted on view (present in the plaintext cache)."
      ((and (stringp text) (fboundp 'whatsapp--pq-text-p)
            (whatsapp--pq-text-p text))
       (or (and (boundp 'whatsapp-pq--plain-cache)
-               (let ((cached (gethash (list (bound-and-true-p whatsapp-chat--jid)
+               (let ((cached (gethash (whatsapp--pq-cache-key (bound-and-true-p whatsapp-chat--jid)
                                             (whatsapp-org--field m "id") text)
                                       whatsapp-pq--plain-cache)))
                  (and (stringp cached) cached)))

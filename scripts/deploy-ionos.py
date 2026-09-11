@@ -122,7 +122,7 @@ print("Verified package: "+str(package),flush=True)
 raise SystemExit(subprocess.call(command))
 '''
         checked(SSH + [remote_command("python3", "-c", bootstrap, remote_dir, sha, args.target or "", "yes" if args.stage_only else "no")], timeout=1800)
-    print("Staging/check completed; no installed files changed." if args.stage_only else "Remote installer completed. The bridge/wuzapi services were not restarted; this is a client-source update.")
+    print("Staging/check completed; no installed files changed." if args.stage_only else "Remote client/bridge source updated. Existing processes were not restarted. Restart the existing bridge launcher to enable the RC10 profile API; wuzapi and sessions are unchanged.")
     return 0
 
 if __name__ == "__main__":

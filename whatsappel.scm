@@ -121,11 +121,28 @@
 (define (json-object? x)
   (and (list? x) (every (lambda (entry) (and (pair? entry) (string? (car entry)))) x)))
 
+;; A duplicated key must not choose a different recipient, event, or status.
+;; JSON arrays produced by guile-json are vectors, objects are string alists.
+(define* (json-unique-tree? value #:optional (depth 0))
+  (and (<= depth 64)
+       (cond ((json-object? value)
+              (let ((seen (make-hash-table)))
+                (every (lambda (entry)
+                         (and (not (hash-ref seen (car entry)))
+                              (begin (hash-set! seen (car entry) #t) #t)
+                              (json-unique-tree? (cdr entry) (1+ depth)))) value)))
+             ((vector? value)
+              (let loop ((i 0))
+                (or (= i (vector-length value))
+                    (and (json-unique-tree? (vector-ref value i) (1+ depth))
+                         (loop (1+ i))))))
+             (else #t))))
+
 (define (safe-json-parse s)
   (catch #t
     (lambda ()
       (let ((obj (json-string->scm s)))
-        (and (json-object? obj) obj)))
+        (and (json-object? obj) (json-unique-tree? obj) obj)))
     (lambda _ #f)))
 
 (define (nonempty-string? s)
@@ -183,6 +200,11 @@
         ((string-index s #\@) => (lambda (i) (substring s 0 i)))
         (else s)))
 
+(define (message-recipient? value)
+  ;; A friendly name or an unknown namespace must never become a phone recipient.
+  (and (string? value) (<= (string-length value) 80)
+       (string-match "^([+]?[0-9]{3,30}(@(s[.]whatsapp[.]net|c[.]us))?|[0-9]{3,30}@lid|[0-9]{3,30}(-[0-9]{1,20})?@g[.]us)$" value)))
+
 (define (current-ts) (number->string (current-time)))
 
 ;; Recognise the post-quantum envelope transport tag.
@@ -193,6 +215,8 @@
 ;;; ---------------------------------------------------------------------------
 
 ;; Returns (values status parsed-or-#f raw-string).
+(define wuzapi-response-limit (make-parameter *max-body-bytes*))
+
 (define (wuzapi-request/raw method path body-obj)
   (let* ((uri  (string-append *wuzapi-base* path))
          (body (and body-obj (string->utf8 (scm->json-string body-obj))))
@@ -216,14 +240,16 @@
                (text (dynamic-wind
                        (lambda () #t)
                        (lambda ()
-                         (let ((bytes (get-bytevector-n rbody (1+ *max-body-bytes*))))
+                         (let ((bytes (get-bytevector-n rbody (1+ (min *max-body-bytes* (wuzapi-response-limit))))))
                            (when (and (bytevector? bytes)
-                                      (> (bytevector-length bytes) *max-body-bytes*))
+                                      (> (bytevector-length bytes) (min *max-body-bytes* (wuzapi-response-limit))))
                              (error "upstream response exceeds configured limit"))
                            (if (eof-object? bytes) "" (body->string bytes))))
                        (lambda () (close-port rbody))))
                (parsed (and (> (string-length text) 0)
-                            (catch #t (lambda () (json-string->scm text)) (lambda _ #f)))))
+                            (catch #t (lambda () (let ((obj (json-string->scm text)))
+                                                  (and (json-unique-tree? obj) obj)))
+                                   (lambda _ #f)))))
           (values status parsed text))))))
 
 (define (wuzapi-request method path body-obj)
@@ -247,6 +273,29 @@
 (define *unread* (make-hash-table))   ; jid -> integer
 (define *names*  (make-hash-table))   ; jid -> push name
 (define *smutex* (make-mutex))
+
+;;; Versioned read snapshots. Invalidation happens under *smutex*; JSON encoding
+;;; happens after releasing it. Revisions are process-scoped, never timestamps.
+(define *read-epoch* (format #f "~a-~a-~a" (getpid) (car (gettimeofday)) (cdr (gettimeofday))))
+(define *read-generation* 0)
+(define *read-chat-revisions* (make-hash-table))
+(define *read-summary-cache* #f)
+
+(define (invalidate-read-state! key)
+  (set! *read-generation* (1+ *read-generation*))
+  (set! *read-summary-cache* #f)
+  (when key (hash-set! *read-chat-revisions* key *read-generation*)))
+
+(define (read-revision generation suffix)
+  (string-append *read-epoch* ":" (number->string generation) ":" suffix))
+
+(define (set-contact-name! jid name)
+  (with-mutex *smutex*
+    (let ((key (normalize-jid jid)))
+      (unless (equal? name (hash-ref *names* key #f))
+        (hash-set! *names* key name)
+        (invalidate-read-state! key)))))
+
 
 (define (record-id rec) (let ((id (jget rec "id"))) (and (nonempty-string? id) id)))
 
@@ -288,7 +337,8 @@
              (set! oldest chat) (set! oldtime ts)))) *chats*)
       (when oldest
         (for-each (lambda (table) (hash-remove! table oldest))
-                  (list *chats* *unread* *names* *rawjid*))))))
+                  (list *chats* *unread* *names* *rawjid* *read-chat-revisions*))
+        (invalidate-read-state! #f)))))
 
 (define (merge-records current incoming)
   ;; History never replaces live messages; a refresh may enrich an existing ID.
@@ -322,6 +372,7 @@
       (let ((nm (jget rec "name")))
         (when (and (nonempty-string? nm) (not (jget rec "me")))
           (hash-set! *names* key nm)))
+      (invalidate-read-state! key)
       (not duplicate?))))
 
 (define (store-inbound! rec)
@@ -380,17 +431,17 @@
                    ((assoc-ref qm "audioMessage")   "[audio]")
                    (else #f))))))
 
-;; Parse a webhook payload (JSON or form jsonData) into a message record.
+(load (string-append (dirname (current-filename)) "/whatsappel-transport.scm"))
+
+;; Parse a webhook payload (JSON, JSON jsonData or form jsonData) into a record.
 ;; Keep parsed fields only; duplicating raw/base64 webhook data wastes memory.
 (define (extract-message raw)
-  (let ((o (or (safe-json-parse raw)
-               (let ((jd (form-param raw "jsonData")))
-                 (and jd (safe-json-parse jd))))))
+  (let ((o (parse-webhook raw)))
     (if (not (pair? o))
         #f
         (let* ((ev     (assoc-ref o "event"))
                (info   (and (json-object? ev) (jget ev "Info" "info")))
-               (msg    (and (json-object? ev) (jget ev "Message" "message")))
+               (msg    (unwrap-message (and (json-object? ev) (jget ev "Message" "message"))))
                (sender (and (pair? info) (or (assoc-ref info "Sender")
                                              (assoc-ref info "Chat"))))
                (chat   (and (pair? info) (or (assoc-ref info "Chat")
@@ -486,7 +537,7 @@
                                    (let ((x (assoc-ref info "FirstName")))   (and (string? x) (> (string-length x) 0) x))
                                    (let ((x (assoc-ref info "BusinessName"))) (and (string? x) (> (string-length x) 0) x))))))
                (when (and (string? jid) nm)
-                 (hash-set! *names* (normalize-jid jid) nm))))
+                 (set-contact-name! jid nm))))
            data)))))
   (call-with-values (lambda () (wuzapi-request 'GET "/group/list" #f))
     (lambda (st parsed raw)
@@ -497,7 +548,7 @@
            (let ((jid (and (pair? g) (assoc-ref g "JID")))
                  (nm  (and (pair? g) (assoc-ref g "Name"))))
              (when (and (string? jid) (string? nm) (> (string-length nm) 0))
-               (hash-set! *names* (normalize-jid jid) nm))))
+               (set-contact-name! jid nm))))
          (->list groups))))))
 
 ;; Build a store record from one history row. Parses the embedded whatsmeow
@@ -509,8 +560,10 @@
   (let* ((dj     (assoc-ref row "data_json"))
          (parsed (and (string? dj) (safe-json-parse dj)))
          (info   (and (pair? parsed) (assoc-ref parsed "Info")))
-         (msg    (and (pair? parsed) (assoc-ref parsed "Message")))
-         (fromme (and (pair? info) (eq? #t (assoc-ref info "IsFromMe"))))
+         (msg    (unwrap-message (and (pair? parsed) (assoc-ref parsed "Message"))))
+         (fromme (if (and (pair? info) (assoc "IsFromMe" info))
+                     (eq? #t (assoc-ref info "IsFromMe"))
+                     (equal? (assoc-ref row "sender_jid") "me")))
          (name   (and (pair? info) (assoc-ref info "PushName")))
          (mtype  (assoc-ref row "message_type"))
          (text   (assoc-ref row "text_content"))
@@ -556,6 +609,7 @@
               (trim-chats! key)
               (hash-set! *rawjid* key jid)
               (hash-set! *chats* key (merge-records (hash-ref *chats* key '()) sorted))
+              (invalidate-read-state! key)
               (unless (hash-ref *unread* key #f) (hash-set! *unread* key 0))
               ;; If contacts/groups didn't name this chat, fall back to the
               ;; PushName carried by its most recent inbound (non-me) message.
@@ -614,29 +668,47 @@
 ;;; ---------------------------------------------------------------------------
 
 (define (handle-connect)
-  (let ((events (filter (lambda (s) (> (string-length s) 0))
-                        (map string-trim-both (string-split *subscribe* #\,)))))
-    (call-with-values
-        (lambda () (wuzapi-request 'POST "/session/connect"
-                                   (list (cons "Subscribe" (list->vector events))
-                                         (cons "Immediate" #t))))
-      (lambda (cstatus cparsed ctext)
-        (call-with-values
-            (lambda () (wuzapi-request 'POST "/webhook"
-                                       (list (cons "webhookURL" *hook-url*))))
-          (lambda (wstatus wparsed wtext)
-            (json-response (if (and (upstream-ok? cstatus cparsed)
-                                                 (upstream-ok? wstatus wparsed)) 200 502)
-                           (list (cons "connect_status" cstatus)
-                                 (cons "connect" (or cparsed ctext))
-                                 (cons "webhook_registered"
-                                       (upstream-ok? wstatus wparsed))))))))))
+  ;; Explicit legacy command. Inspect configuration first; unavailable schema
+  ;; must never erase subscriptions. Opening the UI does not call this command.
+  (parameterize ((wuzapi-response-limit 65536))
+    (call-with-values (lambda () (wuzapi-request 'GET "/webhook" #f))
+      (lambda (ws wp wr)
+        (let ((config (and (upstream-ok? ws wp) (webhook-config wp))))
+          (if (not config)
+              (json-response 502 '(("error" . "Cannot preserve upstream subscriptions; connect was not attempted")))
+              (let* ((configured (filter (lambda (s) (> (string-length s) 0))
+                                  (map string-trim-both (string-split *subscribe* #\,))))
+                     (events (delete-duplicates (append (cadr config) configured '("Message" "ReadReceipt")))))
+                (call-with-values
+                    (lambda () (wuzapi-request 'POST "/session/connect"
+                                (list (cons "Subscribe" (list->vector events)) (cons "Immediate" #t))))
+                  (lambda (status parsed raw)
+                    (if (not (upstream-ok? status parsed))
+                        (json-response 502 '(("error" . "Connect not confirmed; no automatic retry")))
+                        (let ((repair (transport-repair #f)))
+                          (json-response 200
+                            (append (list (cons "connect_status" status)
+                                          (cons "webhook_registered"
+                                            (equal? (assoc-ref repair "repair") "registered-not-reachability-tested"))) repair)))))))))))))
 
-(define (respond-send status parsed text)
-  (json-response (if (upstream-ok? status parsed) 200 502)
-                 (list (cons "wuzapi_status" status) (cons "data" (or parsed text)))))
+(define* (respond-send status parsed text #:optional expected-chat)
+  ;; An ID is upstream acceptance, NOT a delivered/read receipt.  Do not reflect
+  ;; provider error text or store a successful-looking message on ambiguity.
+  (let ((id (upstream-send-id status parsed)))
+    (json-response (if id 200 502)
+      (if id
+          (append
+           (list (cons "wuzapi_status" status) (cons "message_id" id)
+                 (cons "delivery" "accepted")
+                 (cons "data" (list (cons "success" #t)
+                                   (cons "data" (list (cons "Id" id))))))
+           (if expected-chat
+               (list (cons "accepted_chat" expected-chat) (cons "recipient_contract" 1))
+               '()))
+          (list (cons "wuzapi_status" status) (cons "uncertain" #t)
+                (cons "error" "Send not confirmed; check the recipient before retrying"))))))
 
-(define (handle-send body-str)
+(define* (handle-send body-str #:optional verified?)
   (let* ((o    (safe-json-parse body-str))
          (to   (and (pair? o) (assoc-ref o "to")))
          (text (and (pair? o) (assoc-ref o "body")))
@@ -648,7 +720,9 @@
          (ctx   (and (string? rid) (string? rpart)
                      (> (string-length rid) 0) (> (string-length rpart) 0)
                      (list (cons "StanzaID" rid) (cons "Participant" rpart)))))
-    (if (or (not (valid-target? to)) (not (nonempty-string? text))
+    (if (or (not (valid-target? to))
+            (and verified? (not (message-recipient? to)))
+            (not (nonempty-string? text))
             (and (string? text) (> (string-length text) *max-text-length*))
             (not (optional-string? rid 256)) (not (optional-string? rpart 256))
             (not (optional-string? rtext *max-text-length*)))
@@ -661,15 +735,16 @@
                                                          (cons "QuotedText" (or rtext "")))
                                                    '()))))
           (lambda (status parsed raw)
-            (when (upstream-ok? status parsed)
+            (when (upstream-send-id status parsed)
               (store-outbound! to (filter-false
                                    (list (cons "from" "me") (cons "me" #t)
                                          (cons "text" text)
-                                         (cons "id" (jget (jget parsed "data") "Id" "ID" "id"))
+                                         (cons "id" (upstream-send-id status parsed))
+                                         (cons "delivery" "accepted")
                                          (cons "kind" (and (pq-text? text) "pq"))
                                          (cons "reply" (and ctx (or rtext "")))
                                          (cons "ts" (current-ts))))))
-            (respond-send status parsed raw))))))
+            (respond-send status parsed raw (and verified? (normalize-jid to))))))))
 
 ;; /send/gif remains an MP4 video alias. Stock wuzapi has no GIF-loop flag.
 (define *media-specs*
@@ -741,10 +816,11 @@
                                  (cons "Caption" caption) (cons "FileName" filename)
                                  (cons "MimeType" (car info))))))
         (lambda (status parsed raw)
-          (when (upstream-ok? status parsed)
+          (when (upstream-send-id status parsed)
             (store-outbound! to (filter-false
               (list (cons "from" "me") (cons "me" #t) (cons "kind" kind)
-                    (cons "id" (jget (jget parsed "data") "Id" "ID" "id"))
+                    (cons "id" (upstream-send-id status parsed))
+                                         (cons "delivery" "accepted")
                     (cons "caption" caption) (cons "text" caption)
                     (cons "filename" filename) (cons "mimetype" (car info))
                     (cons "ts" (current-ts))))))
@@ -841,7 +917,7 @@
         (json-response 400 '(("error" . "missing 'id'")))
         (relay 'POST "/chat/mediaretry" (list (cons "Id" id))))))
 
-(define (handle-webhook body-str)
+(define (handle-message-webhook body-str)
   (let ((rec (extract-message body-str)))
     (cond
      ((not rec) (json-response 400 '(("error" . "invalid webhook JSON"))))
@@ -860,41 +936,158 @@
       (json-response 400 '(("error" . "invalid message fields"))))
      (else
       (let ((stored? (store-inbound! rec)))
+        (transport-note-message!)
         (json-response 200 (list (cons "success" #t) (cons "duplicate" (not stored?)))))))))
 
-(define (handle-chats)
-  (with-mutex *smutex*
-    (let ((out '()))
-      (hash-for-each
-       (lambda (jid msgs)
-         (let* ((lastm (if (null? msgs) #f (last msgs)))
-                (lt    (and lastm
-                            (let ((k (assoc-ref lastm "kind")))
-                              (cond ((equal? k "pq") "[encrypted]")
-                                    ((assoc-ref lastm "text"))
-                                    (k (string-append "[" k "]"))
-                                    (else #f)))))
-                (lts   (and lastm (assoc-ref lastm "ts"))))
-           (set! out (cons (list (cons "jid" jid)
-                                 (cons "name" (hash-ref *names* jid jid))
-                                 (cons "unread" (hash-ref *unread* jid 0))
-                                 (cons "last" (or lt ""))
-                                 (cons "ts" (or lts "")))
-                           out))))
-       *chats*)
-      (json-response 200 (list->vector
-        (sort out (lambda (a b)
-          (let ((ta (timestamp-value a)) (tb (timestamp-value b)))
-            (if (= ta tb) (string<? (jget a "jid") (jget b "jid")) (> ta tb))))))))))
+(define (chat-summaries/locked)
+  ;; Rebuild only after mutation, not on each idle poll. Legacy callers retain
+  ;; their original array shape; previews are bounded for both read versions.
+  (or *read-summary-cache*
+      (let ((out '()))
+        (hash-for-each
+         (lambda (jid msgs)
+           (let* ((lastm (and (pair? msgs) (last msgs)))
+                  (kind (and lastm (jget lastm "kind")))
+                  (text (and lastm (jget lastm "text")))
+                  (preview (cond ((equal? kind "pq") "[encrypted]")
+                                 ((string? text) text)
+                                 ((string? kind) (string-append "[" kind "]"))
+                                 (else ""))))
+             (set! out (cons (list (cons "jid" jid)
+                                   (cons "name" (hash-ref *names* jid jid))
+                                   (cons "unread" (hash-ref *unread* jid 0))
+                                   (cons "last" (substring preview 0 (min 240 (string-length preview))))
+                                   (cons "ts" (or (and lastm (jget lastm "ts")) ""))) out))))
+         *chats*)
+        (set! *read-summary-cache*
+              (list->vector
+               (sort out (lambda (a b)
+                           (let ((ta (timestamp-value a)) (tb (timestamp-value b)))
+                             (if (= ta tb) (string<? (jget a "jid") (jget b "jid")) (> ta tb)))))))
+        *read-summary-cache*)))
+
+(define* (handle-chats #:optional query)
+  (let ((snapshot
+         (with-mutex *smutex*
+           (if (not (equal? "2" (form-param query "v")))
+               (chat-summaries/locked)
+               (let* ((revision (read-revision *read-generation* "chats"))
+                      (same? (equal? revision (form-param query "since"))))
+                 (append (list (cons "version" 2) (cons "revision" revision)
+                               (cons "async_media" #t) (cons "unchanged" same?))
+                         (if same? '() (list (cons "chats" (chat-summaries/locked))))))))))
+    (json-response 200 snapshot)))
+
+(define (read-window-limit query)
+  (let ((raw (form-param query "limit")))
+    (if (not raw) 60
+        (and (string-match "^[0-9]{1,5}$" raw)
+             (let ((n (string->number raw))) (and (<= 1 n 10000) n))))))
 
 (define (handle-chat-messages query)
-  (let ((jid (form-param query "jid")))
-    (if (not (valid-target? jid))
-        (json-response 400 '(("error" . "missing jid")))
-        (with-mutex *smutex*
-          (let* ((key (normalize-jid jid)) (msgs (hash-ref *chats* key '())))
-            (when (hash-ref *chats* key #f) (hash-set! *unread* key 0))
-            (json-response 200 (list->vector msgs)))))))
+  (let* ((jid (form-param query "jid"))
+         (v2? (equal? "2" (form-param query "v")))
+         (limit (if v2? (read-window-limit query) *chat-cap*)))
+    (cond
+     ((not (valid-target? jid)) (json-response 400 '(("error" . "missing jid"))))
+     ((not limit) (json-response 400 '(("error" . "limit must be 1..10000"))))
+     (else
+      (let ((snapshot
+             (with-mutex *smutex*
+               (let* ((key (normalize-jid jid)) (msgs (hash-ref *chats* key '()))
+                      (total (length msgs)))
+                 ;; v2 diagnostics/prefetch is side-effect free unless read=1.
+                 ;; Preserve legacy /chat's existing mark-read behavior.
+                 (when (and (or (not v2?) (equal? "1" (form-param query "read")))
+                            (> (hash-ref *unread* key 0) 0))
+                   (hash-set! *unread* key 0)
+                   (invalidate-read-state! #f))
+                 (if (not v2?) (list->vector msgs)
+                     (let* ((rev (read-revision (hash-ref *read-chat-revisions* key 0)
+                                               (number->string limit)))
+                            (same? (equal? rev (form-param query "since"))))
+                       (append
+                        (list (cons "version" 2) (cons "revision" rev)
+                              (cons "async_media" #t) (cons "unchanged" same?)
+                              (cons "total" total) (cons "limit" limit)
+                              (cons "has_more" (> total limit)))
+                        (if same? '() (list (cons "messages" (list->vector (take-last msgs limit))))))))))))
+        (json-response 200 snapshot))))))
+
+;;; Keep slow upstream downloads off the serial HTTP accept loop. At most two
+;;; workers/results exist. Send endpoints are never routed through this queue.
+;;; A hung upstream occupies one worker, not the main chat-read listener.
+(define *media-job-mutex* (make-mutex))
+(define *media-jobs* (make-hash-table))
+(define *media-job-counter* 0)
+
+(define (prune-media-jobs!)
+  (let ((now (car (gettimeofday))) (expired '()))
+    (hash-for-each
+     (lambda (key job)
+       (when (and (vector-ref job 0) (> (- now (vector-ref job 1)) 60))
+         (set! expired (cons key expired)))) *media-jobs*)
+    (for-each (lambda (key) (hash-remove! *media-jobs* key)) expired)))
+
+(define (start-media-job body)
+  (let ((id (with-mutex *media-job-mutex*
+              (prune-media-jobs!)
+              (and (< (hash-count (const #t) *media-jobs*) 2)
+                   (begin
+                     (set! *media-job-counter* (1+ *media-job-counter*))
+                     (let ((id (read-revision *media-job-counter* "media")))
+                       (hash-set! *media-jobs* id (vector #f 0 #f #f)) id))))))
+    (if (not id) (json-response 429 '(("error" . "media workers busy; retry explicitly")))
+        (begin
+          (catch #t
+            (lambda ()
+              (call-with-new-thread
+               (lambda ()
+                 (call-with-values
+                     (lambda ()
+                       (catch #t (lambda () (handle-download body))
+                              (lambda _ (json-response 502 '(("error" . "media upstream unavailable"))))))
+                   (lambda (response bytes)
+                     (with-mutex *media-job-mutex*
+                       (hash-set! *media-jobs* id
+                                  (vector #t (car (gettimeofday)) response bytes))))))))
+            (lambda _
+              (with-mutex *media-job-mutex* (hash-remove! *media-jobs* id))
+              (throw 'upstream-failure)))
+          (json-response 202 (list (cons "job" id)))))))
+
+(define (poll-media-job query)
+  (let* ((id (form-param query "id"))
+         (job (with-mutex *media-job-mutex*
+                (prune-media-jobs!)
+                (let ((job (and (string? id) (<= (string-length id) 160)
+                                (hash-ref *media-jobs* id #f))))
+                  ;; A completed read result is single-consumer. No message is
+                  ;; sent or retried; another explicit download remains safe.
+                  (when (and job (vector-ref job 0)) (hash-remove! *media-jobs* id))
+                  job))))
+    (cond ((not job) (json-response 404 '(("error" . "media job expired or unknown"))))
+          ((not (vector-ref job 0)) (json-response 202 '(("pending" . #t))))
+          (else (values (vector-ref job 2) (vector-ref job 3))))))
+
+(load (string-append (dirname (current-filename)) "/whatsappel-profiles.scm"))
+
+(define (handle-webhook body-str)
+  (let* ((o (parse-webhook body-str))
+         (kind (jget o "type")))
+    (transport-note-event! kind)
+    (cond
+     ((not o) (json-response 400 '(("error" . "Invalid webhook envelope"))))
+     ((equal? kind "ReadReceipt") (handle-receipt o))
+     ((member kind '("Presence" "ChatPresence" "Picture" "Connected" "Disconnected"
+                      "LoggedOut" "StreamReplaced" "PrivacySettings"))
+        (if (> (string-length body-str) 65536)
+            (json-response 413 '(("error" . "profile event too large")))
+            (let ((result (profile-event! o)))
+              (json-response (if (eq? result 'invalid) 400 200)
+                             (list (cons "success" (not (eq? result 'invalid)))
+                                   (cons "ignored" (eq? result 'ignored)))))))
+     (else (handle-message-webhook (scm->json-string o))))))
 
 (define (authed? headers)
   (ct-string=? (assoc-ref headers 'x-whatsappel-token) *bridge-token*))
@@ -908,18 +1101,28 @@
         (path    (uri-path (request-uri request)))
         (query   (uri-query (request-uri request)))
         (headers (request-headers request))
-        (body*   (body->string body)))
+        (body*   (if (and (eq? (request-method request) 'POST)
+                               (ct-string=? (uri-path (request-uri request)) *hook-path*))
+                          "" (body->string body))))
     (cond
      ((and (eq? method 'GET) (string=? path "/health"))
-      (json-response 200 '(("status" . "ok") ("service" . "whatsappel"))))
+      (json-response 200 '(("status" . "ok") ("service" . "whatsappel") ("read_api" . 2) ("async_media" . #t)
+                            ("version" . "3.2.0-rc17") ("transport_api" . 1) ("verified_send" . 1))))
      ((and (eq? method 'POST) (ct-string=? path *hook-path*))
-      (handle-webhook body*))
+      (handle-webhook (webhook-body-string headers body)))
      ((not (authed? headers))
       (json-response 401 '(("error" . "unauthorized"))))
+     ((and (eq? method 'GET) (string=? path "/transport/status")) (handle-transport-status))
+     ((and (eq? method 'POST) (string=? path "/transport/repair")) (handle-transport-repair body*))
+     ((and (eq? method 'GET) (string=? path "/profile/capabilities")) (profile-capabilities))
+     ((and (eq? method 'GET) (string=? path "/profiles")) (handle-profiles query))
+     ((and (eq? method 'POST) (string=? path "/profile/request")) (start-profile-job body*))
+     ((and (eq? method 'GET) (string=? path "/profile/job")) (poll-profile-job query))
      ((and (eq? method 'POST) (string=? path "/connect"))  (handle-connect))
      ((and (eq? method 'GET)  (string=? path "/status"))   (relay 'GET "/session/status" #f))
      ((and (eq? method 'GET)  (string=? path "/qr"))       (relay 'GET "/session/qr" #f))
      ((and (eq? method 'POST) (string=? path "/logout"))   (relay 'POST "/session/logout" '()))
+     ((and (eq? method 'POST) (string=? path "/send/verified")) (handle-send body* #t))
      ((and (eq? method 'POST) (string=? path "/send"))     (handle-send body*))
      ((and (eq? method 'POST) (string=? path "/send/image"))    (handle-send-media "image" body*))
      ((and (eq? method 'POST) (string=? path "/send/video"))    (handle-send-media "video" body*))
@@ -927,8 +1130,10 @@
      ((and (eq? method 'POST) (string=? path "/send/audio"))    (handle-send-media "audio" body*))
      ((and (eq? method 'POST) (string=? path "/send/document")) (handle-send-media "document" body*))
      ((and (eq? method 'POST) (string=? path "/send/sticker"))  (handle-send-media "sticker" body*))
-     ((and (eq? method 'POST) (string=? path "/download"))      (handle-download body*))
-     ((and (eq? method 'GET)  (string=? path "/chats"))         (handle-chats))
+     ((and (eq? method 'POST) (string=? path "/download"))
+      (if (equal? "1" (form-param query "async")) (start-media-job body*) (handle-download body*)))
+     ((and (eq? method 'GET) (string=? path "/media-job")) (poll-media-job query))
+     ((and (eq? method 'GET)  (string=? path "/chats"))         (handle-chats query))
      ((and (eq? method 'GET)  (string=? path "/chat"))          (handle-chat-messages query))
      ((and (eq? method 'POST) (string=? path "/react"))    (handle-react body*))
      ((and (eq? method 'POST) (string=? path "/delete"))   (handle-delete body*))

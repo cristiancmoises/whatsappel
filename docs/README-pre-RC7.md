@@ -1,0 +1,441 @@
+# RC6 native-test repairs and safer launch
+
+See `docs/RECOVERY-3.2.0-rc6.md`. This candidate fixes the exact uploaded RC5
+ERT/SRFI-64 test defects. Native RC6 acceptance still requires local execution.
+
+> **3.2.0-rc5 candidate:** shared strict worker protocol, bounded upload replies,
+> validated JSON forwarding, and exact-candidate installation evidence.
+> [RC5 usage](docs/QUALITY-3.2.0-rc5.md) · [Executed audit](docs/AUDIT-3.2.0-rc5.md)
+> · [Português](docs/QUALITY-3.2.0-rc5.pt-BR.md).
+> Native and live acceptance remains incomplete. Earlier release notes below
+> are historical; a skipped suite is now PARTIAL, not a complete PASS.
+
+> **3.2.0-rc4 candidate:** adaptive JSON parsing, unread-only root updates,
+> cache-only conversation switching, compact/detailed rows and Direct filtering.
+> See [usage](docs/NAVIGATION-3.2.0-rc4.md) and the
+> [executed audit](docs/AUDIT-3.2.0-rc4.md). Native/live acceptance is incomplete;
+> parser measurements are not end-to-end WhatsApp speedups.
+
+> **3.2.0-rc3 candidate:** bounded subprocess reads, changed-row updates,
+> focus-aware unread handling, viewport image loading and one-click queued media.
+> [RC3 usage/install guide](docs/RESPONSIVENESS-3.2.0-rc3.md) ·
+> [Executed audit and limits](docs/AUDIT-3.2.0-rc3.md) ·
+> [Português](docs/RESPONSIVENESS-3.2.0-rc3.pt-BR.md).
+> Cumulative package supports exact retained 3.1/RC1/RC2 contents. Native/live
+> acceptance remains incomplete; older release sections below are historical.
+
+<div align="center">
+
+<img src="assets/logo.png" alt="whatsappel" width="200">
+
+# WhatsAppel 3.2.0-rc5 — WhatsApp in Emacs
+
+**Guile bridge · wuzapi engine · no Baileys · no JavaScript**
+
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-3.2.0--rc5-orange.svg)](CHANGELOG.md)
+[![Emacs](https://img.shields.io/badge/Emacs-%E2%89%A528-7F5AB6.svg)](https://www.gnu.org/software/emacs/)
+
+Official: [git.securityops.co/cristiancmoises/whatsappel](https://git.securityops.co/cristiancmoises/whatsappel)
+· Mirror: [Codeberg](https://codeberg.org/berkeley/whatsappel)
+· Mirror: [GitHub](https://github.com/cristiancmoises/whatsappel)
+
+</div>
+
+A WhatsApp client for Emacs whose UI/UX follows telega.el. The former Node/Baileys
+backend remains **Guile Scheme**, with **Emacs Lisp** for the interface. A small
+**Python 3** worker handles bounded reads, asynchronous attachment uploads and explicit GIF
+conversion; Python also supports the update and publication tooling. The
+WhatsApp multi-device protocol itself is delegated to **wuzapi**
+(Go/[whatsmeow](https://github.com/tulir/whatsmeow)) over its local REST API —
+that protocol (Noise + the Signal double-ratchet + WhatsApp protobufs) has no Guile
+implementation and a hand-rolled one would be a homemade-crypto liability. No
+JavaScript anywhere.
+
+## 3.2.0-rc1 workspace update
+
+**Release candidate, not a completed production certification.** The recorded
+Python/loopback/media-fixture checks ran successfully. Native Emacs, Guile, fish,
+mpv and Rust checks were blocked in the build environment. The updater requires
+native changed-code gates to pass on the destination before replacing source.
+
+The workspace adds a desktop-menu launcher, a chat sidebar, visible Image / Video /
+GIF / Record voice / File buttons, and an explicit Preview → Send attachment stage.
+Text sends and upload workers are asynchronous. Draft edits made during a send
+are preserved. Conversations initially render 100 messages, with Show older to
+expand; preview caching and coalesced repaints reduce repeated work.
+
+Images have Fit, zoom and Save original controls. Audio/video opens in mpv from
+private local snapshots, removed when the player exits. Raw GIF files remain
+original documents unless you explicitly prepare a bounded MP4 copy. Voice capture
+uses FFmpeg and Opus audio; a native WhatsApp voice-note badge is not promised.
+
+- [3.2 user and deployment guide](docs/WORKSPACE-3.2.md) · [Guia em português](docs/WORKSPACE-3.2.pt-BR.md)
+- [3.2 audit and limitations](docs/AUDIT-3.2.0-rc1.md) · [Auditoria em português](docs/AUDIT-3.2.0-rc1.pt-BR.md)
+- [Executed implementation specification](docs/PROMPT-3.2.0-rc1.md)
+- [README em português brasileiro](README.pt-BR.md)
+
+The Guile bridge, wuzapi session and PQ identity files are not replaced by this
+update. The interface runs on the desktop: this is **not a browser application or
+a new service to expose through Nginx Proxy Manager**. Existing Org integration
+and the synchronous low-level media helper remain available.
+
+## Earlier 3.1 upgrade
+
+A native dashboard with clickable actions, chat filtering, a command palette and
+an explicit original-file attachment path makes everyday use easier. Background
+refresh is asynchronous, concurrent polls are suppressed, unchanged history is
+not rebuilt, and image prefetch and memory caches are bounded. Existing compose,
+reply, reaction and Org commands remain available.
+
+- [User guide: English](docs/USAGE.md) · [Guia: português brasileiro](docs/USAGE.pt-BR.md)
+- [Apply and publish with fish](docs/DEPLOY.md) · [Audit and validation](docs/AUDIT.md)
+- [Executed upgrade specification](docs/UPGRADE_PROMPT.md)
+
+**Original images:** choose **Original** to send the original bytes as a document.
+This avoids the image delivery recompression path. Inline preview size does not
+change the file. Unsupported image/video/audio formats are sent as documents;
+no implicit conversion or relabeling pretends they are supported native media.
+
+This is a reviewed upgrade candidate. Local and mocked integration results are
+recorded in the audit; live linking, delivery and your deployed wuzapi version
+still need a smoke test on your machine.
+
+## Architecture
+
+```
+  Emacs (whatsapp.el)                 Guile (whatsappel.scm)             wuzapi (Go/whatsmeow)
+ ┌───────────────────────┐  HTTP+tok ┌──────────────────────────┐  HTTP  ┌─────────────────────┐
+ │ root chat-list buffer │ ────────► │ /chats /chat /send       │ ─────► │ /chat/send/text|...  │ ──► WhatsApp
+ │ per-chat buffers      │ ◄──────── │ /send/{image,video,...}  │ ◄───── │ /chat/download*      │
+ │ inline media          │   :7337   │ /download  /connect /qr  │        │ /session/*           │
+ │                       │           │ /hook/<token>  ◄─────────┼────────┤ webhook (inbound)    │
+ └───────────────────────┘ loopback  └──────────────────────────┘  POST  └─────────────────────┘
+```
+
+The bridge keeps a per-chat message store fed by inbound webhooks, records your
+sent messages, and unifies 1:1 and group keys so each conversation is one chat.
+
+## Quick start
+
+```
+./setup.sh        # checks deps, builds+installs pqenv, makes config, generates a token
+# start wuzapi (below), then put its user token in .env (WUZAPI_TOKEN)
+make run          # loads .env and starts the bridge
+```
+
+`setup.sh` is idempotent — it never overwrites an existing `.env` or PQ identity.
+It installs `pqenv` to `~/.local/bin` and creates `~/.config/whatsappel/pq`. A
+`Makefile` (`make check|pqenv|install|run|clean`) and a hardened systemd user
+unit (`whatsappel.service`) are included. Then load `whatsapp.el` in Emacs (see
+[Emacs setup](#emacs-setup)).
+
+## UI/UX (telega-style)
+
+- **Root buffer** (`*WhatsApp*`): the chat list, with unread counts and last
+  message. `RET` opens a chat.
+- **Chat buffer** (`*WhatsApp: <jid>*`): read-only history above an editable
+  input prompt at the bottom. Type and `RET` to send; `C-j` for a newline.
+- **Media model, same as telega**: images and stickers (incl. WebP) render
+  inline, scaled to a sane width (`whatsapp-image-max-width` /
+  `whatsapp-sticker-max-width`); audio, video, GIFs and documents open in an
+  external player. Inbound images/stickers are downloaded and cached
+  automatically (toggle with `whatsapp-auto-load-images`); any media can be saved
+  to a file (`s`). All wuzapi media kinds are supported end to end
+  (image/sticker/video/gif/audio/document), with the correct download endpoint and
+  `DirectPath` per kind.
+- **Telega-style actions** on the message at point (`C-c C-m` menu, or direct
+  keys): react with an emoji, **native quoted reply** (threaded server-side via
+  WhatsApp's `ContextInfo`), forward to another chat, copy text, save media,
+  delete (for everyone), mark read. Inbound replies show the quoted text inline.
+- **Expired media** (older than WhatsApp's CDN retention — common for history that
+  predates the link) cannot be re-downloaded directly. The **media-retry** action
+  (`R` on the media line) asks the sender to re-upload it; this needs the wuzapi
+  patch in [`contrib/wuzapi/`](contrib/wuzapi/) and is best-effort (the sender must
+  be online and still have the media). Media received *after* linking downloads
+  and renders normally.
+
+### Keybindings
+
+Root buffer (`whatsapp-root-mode`):
+
+| Key | Action |
+|---|---|
+| `RET` | open chat at point |
+| `n` / `p` | next / previous chat |
+| `g` | refresh chat list |
+| `j` | jump to a chat by number |
+| `q` | bury buffer |
+
+Chat buffer (`whatsapp-chat-mode`):
+
+| Key | Action |
+|---|---|
+| `RET` | send the input |
+| `C-j` | newline in input |
+| `C-c C-a` then `i v a f s g` | attach image / video / audio / file / sticker / gif |
+| `RET` or `o` on a media line | download + open that media |
+| `s` on a media line | save that media to a file |
+| `R` on a media line | retry (re-request) expired media |
+| `C-c C-m` (or `m` on media) | message action menu (react / reply / forward / copy / save / open / retry / delete / mark read) |
+| `C-c r` | react to the message at point (emoji) |
+| `C-c C-r` | reply to the message at point (native quoted reply) |
+| `C-c C-k` | cancel the pending reply |
+| `C-c C-f` | forward the message at point to another chat |
+| `C-c C-w` | copy the message text |
+| `C-c C-s` | save the message's media |
+| `C-c C-d` | delete the message (for everyone, if yours) |
+| `C-c C-l` | refresh this chat |
+| `C-c C-e` | compose + send a post-quantum encrypted message |
+| `C-c C-q` | bury buffer |
+
+Global prefix (`whatsapp-prefix-map`, suggested `C-c w`): `w` chat list,
+`j` open chat, `c` connect, `s` status, `S` re-sync from wuzapi, `Q` QR,
+`k` PQ keygen, `i` PQ import
+contact key, `f` show PQ fingerprint.
+
+## Dependencies
+
+- **Guile 3.0** + **guile-json** — the bridge.
+- **wuzapi** (Go) — the WhatsApp engine: <https://github.com/asternic/wuzapi>.
+- **Emacs ≥ 28** — the client. An external player (`mpv`, `xdg-open`, …) for
+  audio/video/GIF.
+
+### Install Guile + guile-json
+
+```
+sudo apt install guile-3.0 guile-json     # Debian/Ubuntu
+sudo pacman -S guile guile-json           # Arch (guile-json may be AUR)
+sudo dnf install guile guile-json         # Fedora
+guix shell -m manifest.scm                # Guix
+```
+
+### wuzapi
+
+```
+git clone https://github.com/asternic/wuzapi.git && cd wuzapi && go build .
+WUZAPI_ADMIN_TOKEN=$(openssl rand -hex 16) ./wuzapi -address 127.0.0.1 -port 8080
+curl -s -X POST -H "Authorization: $WUZAPI_ADMIN_TOKEN" -H 'Content-Type: application/json' \
+     --data '{"name":"me","token":"YOUR_WUZAPI_USER_TOKEN","events":"Message"}' \
+     http://127.0.0.1:8080/admin/users
+```
+
+> wuzapi's user-auth header is `Token` in its examples but `Authorization` in its
+> API reference (varies by build). The bridge defaults to `Token`; override with
+> `WUZAPI_TOKEN_HEADER=Authorization` if needed.
+
+## Run the bridge
+
+```
+cp env.example .env && $EDITOR .env       # set WHATSAPPEL_TOKEN and WUZAPI_TOKEN
+set -a; . ./.env; set +a
+guile whatsappel.scm
+```
+
+`WHATSAPPEL_TOKEN` and `WUZAPI_TOKEN` are required; the bridge refuses to start
+without them. The bridge token needs at least 16 URL-safe ASCII characters
+(letters, digits, `_`, `-`). Generate one with `openssl rand -hex 32`.
+Incoming body limits apply after the Guile server buffers the request. Keep the
+bridge local; upstream requests remain synchronous and need separate network
+timeout/ingress protection for any network-facing deployment.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `WHATSAPPEL_TOKEN` | *(required)* | Emacs↔bridge auth and webhook path secret |
+| `WHATSAPPEL_HOST` | `127.0.0.1` | bind address |
+| `WHATSAPPEL_PORT` | `7337` | bind port |
+| `WHATSAPPEL_PUBLIC_URL` | `http://HOST:PORT` | URL wuzapi calls back for webhooks |
+| `WHATSAPPEL_SUBSCRIBE` | `Message` | wuzapi events to subscribe |
+| `WHATSAPPEL_CHAT_CAP` | `500` | messages retained per chat |
+| `WHATSAPPEL_HISTORY` | `200` | per-chat history depth pulled from wuzapi |
+| `WHATSAPPEL_MAX_CHATS` | `1000` | maximum retained chats |
+| `WHATSAPPEL_MAX_BODY_BYTES` | `25165824` | application body/upstream response limit (24 MiB) |
+| `WHATSAPPEL_MAX_MEDIA_BYTES` | `16777216` | media payload limit (16 MiB) |
+| `WHATSAPPEL_LIDMAP_DB` | *(empty)* | path to wuzapi's `main.db`; read read-only to resolve `@lid` chats to phone/name (empty = off) |
+| `WUZAPI_BASE_URL` | `http://127.0.0.1:8080` | wuzapi base URL |
+| `WUZAPI_TOKEN` | *(required)* | wuzapi per-user token |
+| `WUZAPI_TOKEN_HEADER` | `Token` | header carrying the user token |
+
+## Autostart
+
+Run wuzapi and the bridge at login so they're always up (the bridge depends on
+wuzapi, so start it second / declare the dependency).
+
+**systemd (most distros).** A hardened user unit for the bridge ships as
+[`whatsappel.service`](whatsappel.service):
+
+```
+cp whatsappel.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now whatsappel
+```
+
+Run wuzapi under its own unit (wuzapi ships a `wuzapi.service`), or add one that
+`Before=`/`Wants=` the bridge.
+
+**Guix System / Guix Home (shepherd).** Splice the two services in
+[`contrib/guix-home-whatsappel.scm`](contrib/guix-home-whatsappel.scm) into the
+`services` list of your `home-environment`, then:
+
+```
+guix home reconfigure ~/.config/guix/home.scm
+herd start whatsappel-bridge        # pulls in wuzapi via (requirement '(wuzapi))
+herd status                         # both should be running
+```
+
+Both daemons bind to loopback only; secrets are read at runtime from
+`~/wuzapi/.env` and `~/whatsappel/.env` (mode `600`), never placed in the store.
+The wuzapi session persists under `~/.config/whatsappel/wuzapi-data`, so the phone
+link survives restarts — no re-scan.
+
+## Emacs setup
+
+```elisp
+(add-to-list 'load-path "/path/to/whatsappel")
+(require 'whatsapp)
+(require 'whatsapp-org)            ; optional — Org-mode integration
+(setq whatsapp-bridge-url   "http://127.0.0.1:7337"
+      whatsapp-bridge-token "the-same-value-as-WHATSAPPEL_TOKEN")
+(global-set-key (kbd "C-c w") whatsapp-prefix-map)
+```
+
+`M-x whatsapp-connect` → `M-x whatsapp-qr` (scan via WhatsApp ▸ Linked devices) →
+`M-x whatsapp` (chat list). `M-x whatsapp-toggle-polling` for live updates.
+
+The client's `whatsapp-bridge-token` **must equal** the bridge's `WHATSAPPEL_TOKEN`.
+Instead of copying the secret into your config, read it from `.env` at startup so
+the two can never drift — this is the recommended wiring:
+
+```elisp
+(defun my/whatsapp-load-bridge-env ()
+  "Set bridge URL + token from ~/whatsappel/.env (single source of truth)."
+  (let ((env (expand-file-name "~/whatsappel/.env")) (host "127.0.0.1") (port "7337"))
+    (when (file-readable-p env)
+      (with-temp-buffer
+        (insert-file-contents env)
+        (dolist (pair '(("WHATSAPPEL_HOST" . host) ("WHATSAPPEL_PORT" . port)))
+          (goto-char (point-min))
+          (when (re-search-forward
+                 (format "^[ \t]*\\(?:export[ \t]+\\)?%s=\"?\\([^\"\n]+\\)\"?" (car pair)) nil t)
+            (set (cdr pair) (match-string 1))))
+        (goto-char (point-min))
+        (when (re-search-forward
+               "^[ \t]*\\(?:export[ \t]+\\)?WHATSAPPEL_TOKEN=\"?\\([^\"\n]+\\)\"?" nil t)
+          (setq whatsapp-bridge-token (match-string 1)))))
+    (setq whatsapp-bridge-url (format "http://%s:%s" host port))))
+(with-eval-after-load 'whatsapp (my/whatsapp-load-bridge-env))
+```
+
+## Org-mode integration (optional)
+
+`whatsapp-org.el` is a separate, opt-in module — the core client never loads Org.
+`(require 'whatsapp-org)` adds three seams:
+
+- **`whatsapp:` links.** `org-store-link` (`C-c l`) in a chat buffer or on a
+  root-list line yields `[[whatsapp:<jid>][WhatsApp: <name>]]`; following the link
+  opens that chat. `C-c C-l` completion offers your known chats.
+- **Capture.** `whatsapp-org-capture` (`C-c C-o` in a chat, or `o` in
+  `whatsapp-prefix-map`) files the message at point through `org-capture` with the
+  sender, an inactive timestamp, a jump-back link, and the text as a quote block.
+  PQ-safe: an undecrypted `WAPQ1:` envelope is captured as its placeholder, never
+  silently revealed.
+- **Send from Org.** `whatsapp-org-mode` adds `C-c C-w s` (send the current
+  subtree), `C-c C-w r` (send the region) and `C-c C-w g` (jump entry → chat). The
+  target resolves from the entry's inherited `WHATSAPP_JID` property or a prompt;
+  every send asks for confirmation first.
+
+## Behaviour notes (honest limits)
+
+- **Existing chats on link.** After you link a device, the bridge imports your
+  conversations from wuzapi's history store on startup (and on demand via
+  `POST /sync`), so the chat list and past messages appear without waiting for a
+  live message. This needs wuzapi history retention enabled for the user
+  (`POST /session/history {"history": N}`).
+- **`@lid` names.** Chats addressed by WhatsApp's anonymous linked-ID (`@lid`)
+  have no phone number in the history rows. Point `WHATSAPPEL_LIDMAP_DB` at
+  wuzapi's `main.db` and the bridge reads its `whatsmeow_lid_map` (read-only) to
+  resolve them to a saved contact name, or failing that the real phone number.
+  Without it, such chats show their raw id until a live message supplies a name.
+- Outbound media is shown in the conversation as a `[kind] caption` placeholder —
+  the bytes you sent are not stored back, so they are not re-rendered inline.
+- Inbound media rendering is best-effort: the bridge extracts wuzapi's media
+  download fields from the webhook event defensively across key-casing variants,
+  without retaining the entire raw event in memory. If a build's event schema differs, the
+  message still appears as a labelled placeholder rather than failing.
+- MP4 files requested as GIF mode use video delivery; the checked stock wuzapi
+  does not expose a looping option. Actual `.gif` files
+  use document delivery; the client does not silently transcode them.
+- Tests cover buffer state and mocked HTTP integration. See the audit for exact
+  tool versions, counts, graphical checks and the remaining live-device checks.
+
+## Security model
+
+**Protects**
+- The Emacs-facing API requires `X-Whatsappel-Token`; the inbound webhook is
+  reachable only at `/hook/<token>`. Token comparison visits every byte after a length check; this is not a formal
+  constant-time guarantee in Guile. Bridge and wuzapi default to loopback. Transport inherits WhatsApp's own E2EE.
+
+**Does NOT protect against**
+- A compromised host: the bridge and wuzapi see plaintext locally.
+- wuzapi's on-disk session is a linked-device credential — anyone who can read it
+  can impersonate your WhatsApp. Restrict its directory; use full-disk encryption.
+- Plaintext secrets in `.env` and Emacs config — protect both files.
+- Metadata (who you message, when, group membership) — visible to Meta.
+- Account bans: wuzapi/whatsmeow is an unofficial client; use may violate
+  WhatsApp's Terms of Service.
+
+## Post-quantum messages (opt-in, 1:1)
+
+An optional end-to-end **post-quantum envelope** rides inside a normal WhatsApp
+text message as a `WAPQ1:` blob, built by the bundled [`pqenv`](pqenv/README.md)
+tool (ML-KEM-1024 + ML-DSA-87 + ChaCha20-Poly1305, HKDF-SHA256; primitives from
+the formally verified libcrux). It protects content **only between two whatsappel
+users who have exchanged public keys** — to any normal contact it is an opaque
+blob, and it does not hide metadata from Meta. It is not "post-quantum WhatsApp."
+
+Usage:
+
+1. `C-c w k` (`whatsapp-pq-keygen`) — once, to create your identity. Share
+   `~/.config/whatsappel/pq/identity.public` with your contact.
+2. `C-c w i` (`whatsapp-pq-import-contact`) — import their `.public` and associate
+   it with the chat. Verify the printed fingerprint out of band. The fingerprint is
+   pinned on first import (TOFU): a later import of a *different* key for the same
+   chat is refused — a silent change can mean key substitution — unless you re-verify
+   and override with `C-u C-c w i`.
+3. In the chat, type and press `C-c C-e` to send encrypted. Inbound `WAPQ1:`
+   messages are verified and decrypted on view, shown with a `[PQ]` marker;
+   messages outside the freshness window show `[encrypted — stale/replayed:
+   outside freshness window]` and other failures show `[encrypted — decrypt/verify
+   FAILED]`. The window is `whatsapp-pq-max-age` (default 7 days; 0 disables it).
+
+Limits (carried from the `pqenv` threat model): 1:1 only (group keying is future
+work); the in-chat `C-c C-e` path uses the single-shot envelope, which has **no
+forward secrecy** (long-term KEM identity keys). A forward-secure session layer
+(WAPQR: ephemeral-prekey bootstrap + symmetric ratchet) now exists in `pqenv`
+(`ratchet-prekey`/`-init`/`-accept`/`-send`/`-recv`); wiring stateful per-chat
+sessions into this client is the next step. Replay of *old* captured envelopes is
+blocked by the freshness window on view; per-message replay-on-receive across
+restarts is not wired. See [pqenv/README.md](pqenv/README.md) for the full threat
+model, wire formats, and the WAPQR handshake.
+
+## Repositories
+
+| Role | URL |
+|---|---|
+| **Official** (Forgejo) | <https://git.securityops.co/cristiancmoises/whatsappel> |
+| Mirror (Forgejo BR) | <https://git.securityops.com.br/cristiancmoises/whatsappel> |
+| Mirror (Codeberg) | <https://codeberg.org/berkeley/whatsappel> |
+| Mirror (GitHub) | <https://github.com/cristiancmoises/whatsappel> |
+
+Issues and pull requests are tracked on the Forgejo repo; the mirrors are
+read-only copies kept in sync at each release.
+
+## Author
+
+Cristian Cezar Moisés — <https://securityops.co>
+
+## License
+
+[`AGPL-3.0-only`](LICENSE). A network-facing bridge is the textbook AGPL case: if
+you run a modified version as a service, the AGPL requires you to offer that
+modified source to its users. The bundled `pqenv` crate and the Guile bridge carry
+the same `SPDX-License-Identifier: AGPL-3.0-only` headers.

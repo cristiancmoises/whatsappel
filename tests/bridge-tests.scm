@@ -114,10 +114,52 @@
 (test-equal "absent chat read creates no auxiliary entry" 0 (hash-count (const #t) *unread*))
 (test-assert "non-JSON upstream success is rejected" (not (upstream-ok? 200 #f)))
 (test-assert "bodyless upstream 204 remains successful" (upstream-ok? 204 #f))
-(setenv "WHATSAPPEL_TEST_INTEGER" "0")
-(test-error "zero configured cap fails startup validation"
-  (env-integer "WHATSAPPEL_TEST_INTEGER" "500" 1 10000))
-(unsetenv "WHATSAPPEL_TEST_INTEGER")
+;; SRFI-64's named test-error form has THREE arguments.  With two, the
+;; descriptive string was interpreted as an exception matcher, not a name.
+;; Keep the actual production guard; test both rejection and valid boundaries.
+(let ((previous (getenv "WHATSAPPEL_TEST_INTEGER")))
+  (dynamic-wind
+    (lambda () #t)
+    (lambda ()
+      (setenv "WHATSAPPEL_TEST_INTEGER" "0")
+      (test-error "zero configured cap fails startup validation" #t
+        (env-integer "WHATSAPPEL_TEST_INTEGER" "500" 1 10000))
+      (for-each
+        (lambda (value)
+          (setenv "WHATSAPPEL_TEST_INTEGER" value)
+          (test-error (format #f "invalid configured cap ~s rejected" value) #t
+            (env-integer "WHATSAPPEL_TEST_INTEGER" "500" 1 10000)))
+        '("-1" "10001" "1.0" "1/2" "1+i" "+nan.0" "+inf.0" "bad"))
+      ;; An unrelated exception must not stand in for configuration validation.
+      (test-assert "configuration rejection is the expected Guile error"
+        (catch 'misc-error
+          (lambda () (env-integer "WHATSAPPEL_TEST_INTEGER" "500" 1 10000) #f)
+          (lambda args #t)))
+      (for-each
+        (lambda (value)
+          (setenv "WHATSAPPEL_TEST_INTEGER" (number->string value))
+          (test-equal (format #f "valid configured cap ~a accepted" value) value
+            (env-integer "WHATSAPPEL_TEST_INTEGER" "500" 1 10000)))
+        '(1 500 10000))
+      (unsetenv "WHATSAPPEL_TEST_INTEGER")
+      (test-equal "unset configured cap uses validated default" 500
+        (env-integer "WHATSAPPEL_TEST_INTEGER" "500" 1 10000)))
+    (lambda ()
+      (if previous (setenv "WHATSAPPEL_TEST_INTEGER" previous)
+          (unsetenv "WHATSAPPEL_TEST_INTEGER")))))
+;; RC16: explicit own-history rows do not depend on optional data_json payloads.
+(let* ((row '(("message_id" . "own-history-fixture") ("sender_jid" . "me")
+              ("chat_jid" . "123456789@lid") ("timestamp" . "1750000000")
+              ("data_json" . "") ("message_type" . "text") ("text_content" . "fixture")))
+       (record (history-row->rec row)))
+  (test-equal "own history row remains own without embedded metadata" #t (jget record "me"))
+  (test-equal "own history row preserves recipient namespace" "123456789@lid" (jget record "chat"))
+  (set-cdr! (assoc "data_json" row) "{\"Info\":{\"IsFromMe\":false}}")
+  (test-assert "explicit inbound metadata overrides sender fallback" (not (jget (history-row->rec row) "me")))
+  (set-cdr! (assoc "sender_jid" row) "123456789")
+  (set-cdr! (assoc "data_json" row) "")
+  (test-assert "other sender without metadata is not inferred own" (not (jget (history-row->rec row) "me"))))
+
 (let ((failures (test-runner-fail-count (test-runner-current))))
   (test-end "bridge")
   (exit (if (zero? failures) 0 1)))

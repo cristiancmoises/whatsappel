@@ -24,15 +24,29 @@ def git(repo, *args, check=True, isolated=False, identity=None):
     return result
 
 
+
+def git_blob(repo, path):
+    """Read committed bytes, not a newline-normalized text representation."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    result = subprocess.run(["git", "-C", str(repo), "-c", "core.hooksPath=" + os.devnull,
+                             "cat-file", "blob", "HEAD:" + path],
+                            capture_output=True, timeout=30, env=env)
+    if result.returncode:
+        raise ValueError("Cannot read committed baseline blob")
+    return result.stdout
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("repository", nargs="?", type=Path, default=Path.home() / "whatsappel")
     p.add_argument("--bundle", type=Path, default=Path(__file__).resolve().parents[1])
-    p.add_argument("--worktree", type=Path, default=Path.home() / "whatsappel-publish-3.2.0-rc1")
+    p.add_argument("--worktree", type=Path, default=Path.home() / "whatsappel-publish-3.2.0-rc17")
     p.add_argument("--branch", default="main", help="Destination branch, never force-pushed")
     p.add_argument("--create-missing", action="store_true")
     p.add_argument("--visibility", choices=("public", "private"))
     p.add_argument("--commit-only", action="store_true")
+    p.add_argument("--check", action="store_true", help="Check bundle and committed baseline without creating worktrees, audits, commits or network traffic")
     p.add_argument("--remote", action="append", choices=("forgejo-co", "forgejo-com-br", "github", "codeberg"))
     a = p.parse_args(argv)
     bundle, source, work = a.bundle.expanduser().absolute(), a.repository.expanduser().absolute(), a.worktree.expanduser().absolute()
@@ -46,22 +60,41 @@ def main(argv=None):
         raise ValueError("Choose a separate publication worktree; the existing installation is not committed in place")
     installer.no_links(work)
     source_git = source.is_dir() and git(source, "rev-parse", "--is-inside-work-tree", check=False).returncode == 0
+    if source_git and git(source, "rev-parse", "--show-toplevel").stdout.strip() != str(source):
+        raise ValueError("Use the exact Git project root, not a directory nested inside another repository")
     config_root = source if source_git else Path.home()
     name = git(config_root, "config", "--get", "user.name", check=False).stdout.strip()
     email = git(config_root, "config", "--get", "user.email", check=False).stdout.strip()
     if not name or not email:
         raise ValueError("Configure your real Git user.name and user.email before committing; identity is never invented")
+    # Check committed bytes before creating a worktree or initiating network work.
+    if source_git:
+        for item in spec["files"]:
+            result = git(source, "cat-file", "-e", "HEAD:" + item["path"], check=False)
+            # git's text decoding changes CRLF/encoding; request raw blob bytes instead.
+            if result.returncode == 0:
+                blob = git_blob(source, item["path"])
+                current = __import__("hashlib").sha256(blob).hexdigest()
+            else:
+                current = None
+            if current not in installer.compatible_baselines(item) | {item["after"]}:
+                raise ValueError("Committed HEAD is not a supported baseline: " + item["path"] + "; working-tree edits remain untouched")
+    if a.check:
+        if not source_git:
+            raise ValueError("Read-only check requires an existing Git checkout; publication from a non-Git installation needs a separate clone")
+        print("Bundle and committed baseline are compatible. No worktree, commit, network request or push was created.")
+        return 0
     if not work.exists():
         if source_git:
-            git(source, "worktree", "add", "-b", "whatsappel-3.2.0-rc1", str(work), "HEAD")
+            git(source, "worktree", "add", "-b", "whatsappel-3.2.0-rc17", str(work), "HEAD")
             print("Publication starts from committed HEAD. Uncommitted changes in your original checkout are not included or modified.", flush=True)
         else:
             print("Installation is not a Git checkout. Creating a separate public Codeberg clone; original installation is unchanged.", flush=True)
             git(work.parent, "-c", "credential.helper=", "-c", "http.followRedirects=false", "clone", "--", "https://codeberg.org/berkeley/whatsappel.git", str(work), isolated=True)
-            git(work, "switch", "-c", "whatsappel-3.2.0-rc1")
+            git(work, "switch", "-c", "whatsappel-3.2.0-rc17")
     if git(work, "rev-parse", "--show-toplevel").stdout.strip() != str(work):
         raise ValueError("Publication path must be the exact repository root")
-    if git(work, "symbolic-ref", "--short", "HEAD").stdout.strip() != "whatsappel-3.2.0-rc1":
+    if git(work, "symbolic-ref", "--short", "HEAD").stdout.strip() != "whatsappel-3.2.0-rc17":
         raise ValueError("Publication worktree is on a different branch; no changes made")
     allowed = {item["path"] for item in spec["files"]}
     changed = set(git(work, "diff", "HEAD", "--name-only", "-z").stdout.split("\0")) - {""}
@@ -69,7 +102,10 @@ def main(argv=None):
     if (changed | untracked) - allowed:
         raise ValueError("Publication checkout has unrelated changes; preserve/reconcile them before retrying")
     # Native tests run before installation into even this isolated publication worktree.
-    installer.main([str(work), "--bundle", str(bundle), "--apply"])
+    try:
+        installer.main([str(work), "--bundle", str(bundle), "--apply", "--full-audit"])
+    except installer.UpdateError as exc:
+        raise ValueError(str(exc)) from None
     for item in spec["files"]:
         if installer.digest(work / item["path"]) != item["after"]:
             raise ValueError("Managed source changed during preparation; nothing committed")
@@ -78,7 +114,7 @@ def main(argv=None):
     if staged - allowed:
         raise ValueError("Unexpected staged paths; nothing committed")
     if staged:
-        git(work, "commit", "-m", "Improve WhatsAppel workspace, media preview and asynchronous uploads", "-m", "Prepare 3.2.0-rc1 with bounded history, explicit attachment preview/send, mpv playback, and guarded update workflows. Live graphical and WhatsApp validation remains a release gate.", identity=(name, email))
+        git(work, "commit", "-m", "Guard malformed send-failure responses without discarding drafts", "-m", "Prepare 3.2.0-rc17 from exact retained RC16. Preserve two-pass native validation, account state and unknown edits. Never equate accepted messages with delivery.", identity=(name, email))
     commit = git(work, "rev-parse", "HEAD").stdout.strip()
     print("Publication checkout: " + str(work) + "\nCommit: " + commit, flush=True)
     if a.commit_only:
