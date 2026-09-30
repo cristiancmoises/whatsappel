@@ -204,6 +204,20 @@ class BridgeHTTPTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_archive_roundtrip_and_boolean_validation(self):
+        for archived in (True, False):
+            status, body, _ = self.request("POST", "/archive", {"jid": "551111", "archive": archived})
+            self.assertEqual(status, 200, (archived, body))
+            self.assertEqual(body["wuzapi_status"], 200)
+            sent = self.backend.matching_requests("/chat/archive")[-1]
+            self.assertEqual(sent[2], {"jid": "551111@s.whatsapp.net", "archive": archived})
+        before = len(self.backend.matching_requests("/chat/archive"))
+        for payload in ({"jid": "551111"}, {"jid": "551111", "archive": "false"},
+                        {"jid": "https://other.invalid", "archive": True}):
+            status, _, _ = self.request("POST", "/archive", payload)
+            self.assertEqual(status, 400)
+        self.assertEqual(len(self.backend.matching_requests("/chat/archive")), before)
+
     def chats(self):
         status, result, _ = self.request("GET", "/chats")
         self.assertEqual(status, 200)

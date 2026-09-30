@@ -1,146 +1,108 @@
-# WhatsAppel
+# WhatsAppel 3.3.0
 
-**A native WhatsApp client for Emacs, built around Guile, wuzapi/whatsmeow, Python workers and optional post-quantum tooling.**
+Native WhatsApp workspace for GNU Emacs, with a Guile bridge, bounded Python
+workers and the wuzapi/whatsmeow provider. Contact photos, confirmed archive controls and native conversation tools.
 
-Current release candidate: **3.2.0-rc17**.
+## Photos and conversation tools
 
-WhatsAppel is designed for people who want messaging to live inside Emacs without turning Emacs into a browser wrapper. The client focuses on responsive chat navigation, explicit delivery states, media workflows, privacy-aware profile data, reproducible GNU Guix deployment and guarded updates.
+Photos appear beside contacts in graphical Emacs; initials remain available in
+terminals. Photo work follows visible graphical frames, including daemon clients.
+Press `i` on a contact for a larger photo, refresh, retry and profile diagnostics.
 
-> **Release status:** RC17 is a release candidate. Provider acceptance is not the same as recipient delivery, profile data remains subject to WhatsApp privacy/backend support, and Pale playback is still experimental/unverified. The project intentionally keeps these states explicit instead of presenting unverified behavior as success.
+The Inbox hides conversations archived through this client. Press `a` to archive
+or restore on WhatsApp, `P` to pin locally, and `m` (or right-click) for chat tools.
+Use the Archived and Pinned filters, or `M-x whatsapp-show-archived`. Archive changes
+wait for the provider's success response; failed or timed-out requests keep the
+current view. Pins and confirmed archive choices survive Emacs restarts in private,
+account-scoped JSON. Archive changes made on another device are not imported yet.
 
-## Screenshots
+`M-x whatsappel` is an alias for `M-x whatsapp`. See [Usage](docs/USAGE.md) for
+configuration and shell aliases. The release includes the RC18–20 reliability fixes.
 
-The screenshots below are from the native Emacs interface. The two conversation screenshots had only the Emacs modeline/footer cropped to remove a local account identifier; the other screenshots are included unchanged.
+## Session recovery and truthful status
 
-### Contact list and workspace
+The connection panel now distinguishes the bridge from the WhatsApp backend.
+Cached history remains usable while a separate, account-scoped label reports
+backend readiness. **Connect existing session…** is an explicit, confirmed action;
+its HTTP acknowledgement is not login or delivery. It preserves known event
+subscriptions and never logs out, deletes sessions or resends messages.
 
-![WhatsAppel contact list](docs/screenshots/whatsappel-root.png)
+Use **Open linking QR** only when the backend needs login. Callback registration
+and per-contact Presence consent remain separate choices. The new read-only
+`python3 scripts/doctor-session.py --source "$HOME/whatsappel"` diagnostic reports
+safe state labels. Add `--probe-recent-image` to request one bounded media sample;
+it refuses that sample until a fresh backend check reports connected and logged in.
 
-### Accepted send and delivery controls
+[Session recovery guide](docs/USAGE.md) ·
+[Guia de recuperação](docs/USAGE.pt-BR.md)
 
-![WhatsAppel accepted send](docs/screenshots/whatsappel-accepted.png)
+## Retained photo, media and presence fixes
 
-### Workspace settings
+RC18 moves media-download submissions to a bounded no-proxy worker, uses existing
+authoritative LID mappings for profiles, preserves safe photo-failure categories,
+and adds explicit profile-event registration to the connection panel. Last-seen
+observations are kept separate from current presence. Consent, privacy, account
+boundaries, original send-recipient identities and the no-resend policy remain.
 
-![WhatsAppel settings](docs/screenshots/whatsappel-settings.png)
+[Repair and update guide](docs/USAGE.md) ·
+[Guia em português](docs/USAGE.pt-BR.md) ·
+[Usage](docs/USAGE.md) · [Troubleshooting](docs/USAGE.md)
 
-### Images and chat media
+## Existing GNU Guix installation
 
-![WhatsAppel image view](docs/screenshots/whatsappel-image-view.png)
+Download `whatsappel-3.3.0.zupt` and `SHA256SUMS` from the release, then verify and
+extract the archive using [ZUPT](https://github.com/cristiancmoises/zupt):
 
-### Media inside a conversation
-
-![WhatsAppel media conversation](docs/screenshots/whatsappel-media.png)
-
-More screenshot notes: [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md).
-
-## Highlights
-
-- **Native Emacs UI** with contact list, chat buffers, mouse actions and keyboard-first workflows.
-- **Responsive conversation opening** with deferred history/media work and bounded previews.
-- **Delivery-aware sending** that distinguishes pending, provider acceptance, delivered, read, rejected and unconfirmed states.
-- **Recipient identity preservation** for phone JIDs, LIDs and groups without guessing unsupported mappings.
-- **Images and media** with native image handling, bounded GIF support, voice recording, attachments and explicit playback controls.
-- **Profile photos and presence plumbing** with bounded caches, privacy-aware fallbacks and opt-in presence observation.
-- **Delivery diagnostics** for bridge/provider state, callback registration and subscriptions.
-- **Optional encrypted/PQ workflows** via the retained `pqenv` component.
-- **GNU Guix-friendly deployment** with Fish entry points and no required `sudo`/`guix pull` for normal app updates.
-- **Guarded updates and publication** using exact hashes, private backups, rollback checks and non-force pushes.
-
-## Architecture
-
-```text
-Emacs Lisp client
-       │
-       ├── Python workers ── media/profile/read/send helpers
-       │
-       └── Guile bridge ──── authenticated loopback HTTP
-                              │
-                              └── wuzapi / whatsmeow
-                                      │
-                                      └── WhatsApp
+```sh
+sha256sum -c SHA256SUMS
+zupt test whatsappel-3.3.0.zupt
+zupt extract -o extracted whatsappel-3.3.0.zupt
+cd extracted/whatsappel-3.3.0
 ```
 
-Optional components include FFmpeg, mpv, Pale integration work, Org integration and the Rust `pqenv` utility.
-
-## GNU Guix installation / update
-
-Use the release/update bundle rather than copying files manually over an installation. From an extracted release bundle:
+Within the extracted bundle:
 
 ```fish
 fish scripts/update-and-activate.fish "$HOME/whatsappel" --restart-local
 ```
 
-The guarded workflow runs its required audits before replacing managed files, preserves `.env`, sessions, init files and independently newer PQ data, and refuses unknown local modifications.
+Both full native audits must pass before installing. The active source, service,
+account and listener must match before a local Shepherd restart is allowed.
+Your private `.env`, sessions, init and PQ identity are not replaced.
+After success, save your buffers and completely restart Emacs/its daemon.
+Do not run this bundle command from an unrelated repository checkout.
 
-After a successful client update, fully restart Emacs (including an Emacs daemon if used) so the new Lisp definitions are actually loaded.
+A complete source archive is also included for review. It is NOT an instruction
+to copy the whole tree over private state. Unknown runtime edits are refused.
 
-## Everyday use
+## Native interface
 
-Common actions are available directly in the WhatsAppel buffers:
+![Chat list](docs/screenshots/whatsappel-root.png)
+![Conversation and accepted send](docs/screenshots/whatsappel-accepted.png)
+![Workspace settings](docs/screenshots/whatsappel-settings.png)
+![Inline images](docs/screenshots/whatsappel-image-view.png)
+![Conversation media](docs/screenshots/whatsappel-media.png)
 
-- search/switch/new/refresh conversations;
-- send text and files;
-- preview/send images, video and GIF media;
-- record and preview voice audio before sending;
-- retry failed image work;
-- inspect connection and delivery state;
-- clear local send notes explicitly;
-- open profile/settings/diagnostic views.
+These are the previously approved screenshots; they are not new 3.3.0 acceptance
+results. Image files are unchanged from the approved clean distribution.
 
-The application avoids automatic retries for uncertain sends to reduce duplicate-message risk.
+## Validation
 
-## Media
+Run `python3 -I scripts/audit-workspace.py . --scope full` for the complete audit.
+`make check` includes the native regression suites. A passing fixture does not
+establish live recipient delivery, graphical rendering on every machine, or
+availability of private profile data. Release validation evidence is included as JSON in the update bundle.
 
-Static images are displayed inside Emacs when supported. GIF handling is bounded. Audio uses the explicit local player path. Video playback can be selected from WhatsAppel settings; **mpv is the established playback path while Pale integration remains experimental/unverified**.
+Static images require an appropriate graphical Emacs build. FFmpeg prepares
+thumbnails. Choose mpv explicitly in Settings for external playback. Installing
+PALE separately does not implement the still-missing WhatsAppel PALE adapter.
+Provider acceptance is not recipient delivery. Unknown presence is not idle/offline.
 
-## Presence and profile information
+## Source and license
 
-Presence is evidence-based. WhatsAppel does not infer remote “online”, “offline” or “idle” merely from silence or message age. Profile photos, last-seen and activity indicators depend on backend support, subscriptions and the remote account's privacy settings.
-
-## Security model
-
-WhatsAppel aims to reduce accidental credential and state exposure:
-
-- bridge authentication and loopback-first operation;
-- tokens are not embedded in repository URLs by the publishing workflow;
-- bounded worker responses and deadlines;
-- redirect/destination checks for controlled media/profile retrieval;
-- explicit confirmation before potentially disruptive callback repairs;
-- no automatic replay of uncertain sends;
-- content-anchored updates and rollback refusal after newer edits.
-
-These controls are not an independent security certification, a full decoder sandbox or a claim that every external provider behavior is trustworthy.
-
-## Development and validation
-
-Important validation areas include:
-
-```text
-Emacs byte compilation + ERT
-Guile unit/integration tests
-Python worker regressions
-Fish syntax/workflow checks
-FFmpeg/mpv checks
-Rust tests / formatting / Clippy
-source-integrity verification
-```
-
-See the release audit documentation for the exact results of a specific candidate. A passed fixture does not substitute for live recipient delivery or graphical acceptance.
-
-## Documentation
-
-- [RC17 send-failure repair](docs/SEND-FAILURE-3.2.0-rc17.md)
-- [RC17 audit](docs/AUDIT-3.2.0-rc17.md)
-- [Screenshots](docs/SCREENSHOTS.md)
-- [Português](README.pt-BR.md)
-
-## Project
-
-- Codeberg: `codeberg.org/berkeley/whatsappel`
-- GitHub: `github.com/cristiancmoises/whatsappel`
-- Security Ops forges: `git.securityops.co/cristiancmoises/whatsappel` and `git.securityops.com.br/cristiancmoises/whatsappel`
-
-## License
+- https://codeberg.org/berkeley/whatsappel
+- https://github.com/cristiancmoises/whatsappel
+- https://git.securityops.co/cristiancmoises/whatsappel
+- https://git.securityops.com.br/cristiancmoises/whatsappel
 
 AGPL-3.0-only. See [LICENSE](LICENSE).

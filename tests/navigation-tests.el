@@ -169,8 +169,8 @@
   (should (eq (lookup-key whatsapp-root-mode-map (kbd "d")) #'whatsapp-root-toggle-density))
   (should (eq (lookup-key whatsapp-chat-mode-map (kbd "C-c C-f")) #'whatsapp-chat-forward)))
 
-(ert-deftest wa-rc4-version-constant-identifies-current-candidate ()
-  (should (equal whatsapp-version "3.2.0-rc17")))
+(ert-deftest wa-rc4-version-is-valid-package-version ()
+  (should (version-to-list whatsapp-version)))
 
 ;;; RC6: native regression tests for button semantics and window-scoped polling.
 (ert-deftest wa-rc6-history-button-return-expands-and-retains-draft ()

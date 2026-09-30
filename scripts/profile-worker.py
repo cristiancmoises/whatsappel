@@ -130,7 +130,9 @@ def bridge_request(origin, token, method, path, body=None, timeout=10):
         with conn.getresponse() as res:
             # Do not return upstream diagnostics/URLs/tokens in errors.
             if not 200 <= res.status < 300:
-                return res.status, {'state': 'unsupported' if res.status in {404, 405, 501} else 'unavailable'}
+                return res.status, {'state': 'unsupported' if res.status in {404, 405, 501} else 'unavailable',
+                                    'reason': {401: 'bridge-auth', 403: 'bridge-auth', 404: 'bridge-route',
+                                               405: 'bridge-route', 429: 'bridge-busy'}.get(res.status, 'bridge-network')}
             raw = response_bytes(res, MAX_JSON)
             data = protocol.decode_json(raw)
             if not isinstance(data, dict):
@@ -216,10 +218,10 @@ def fetch_photo(location):
             if res.status != 200:
                 raise Error('Photo unavailable; redirects are not followed.')
             mime = res.getheader('Content-Type', '').split(';', 1)[0].strip().lower()
-            if mime not in {'image/jpeg', 'image/png'}:
+            if mime not in {'image/jpeg', 'image/png', 'application/octet-stream', ''}:
                 raise Error('Unsupported photo media type.')
             raw = response_bytes(res, MAX_IMAGE)
-            dimensions(raw, mime)
+            dimensions(raw, None if mime in {'application/octet-stream', ''} else mime)
             return raw
     finally:
         connection.close()
@@ -319,14 +321,18 @@ def validate_snapshot(data, keys):
             raise Error('Incomplete profile metadata.')
         if 'last_seen' in p and (p['availability'] != 'offline' or type(p['last_seen']) is not int or p['last_seen'] <= 0 or p['last_seen'] > int(time.time())):
             raise Error('Unsubstantiated last-seen timestamp.')
-        for field in ('availability_age', 'activity_age', 'last_seen', 'photo_revision'):
+        if 'last_seen_observed' in p and (p['jid'].endswith('@g.us') or p['availability'] == 'online'
+                or type(p['last_seen_observed']) is not int or p['last_seen_observed'] <= 0
+                or p['last_seen_observed'] > int(time.time())):
+            raise Error('Invalid historical last-seen observation.')
+        for field in ('availability_age', 'activity_age', 'last_seen', 'last_seen_observed', 'photo_revision'):
             if field in p and (type(p[field]) is not int or not 0 <= p[field] <= 4102444800):
                 raise Error('Invalid profile timestamp or revision.')
         if p.get('photo_state') not in {'unknown', 'changed', 'removed', 'unavailable'}:
             raise Error('Invalid photo state.')
     if seen != set(keys):
         raise Error('Incomplete profile snapshot.')
-    fields = {'jid', 'availability', 'availability_age', 'activity', 'activity_age', 'photo_revision', 'photo_state', 'last_seen'}
+    fields = {'jid', 'availability', 'availability_age', 'activity', 'activity_age', 'photo_revision', 'photo_state', 'last_seen', 'last_seen_observed'}
     return {'version': 1, 'epoch': data['epoch'],
             'profiles': [{k: v for k, v in p.items() if k in fields} for p in data['profiles']]}
 
@@ -373,7 +379,7 @@ def execute(spec):
                 raise Error('Invalid photo revision.')
             try:
                 raw_photo = fetch_photo(body.get('url'))
-            except PhotoFailure:
+            except (PhotoFailure, protocol.DeadlineError):
                 raise
             except (Error, OSError, ValueError, http.client.HTTPException):
                 raise PhotoFailure('cdn-network') from None
@@ -381,6 +387,8 @@ def execute(spec):
                 raise PhotoFailure('decoder-unavailable')
             try:
                 png = thumbnail(raw_photo, 256 if action == 'photo' else 96)
+            except protocol.DeadlineError:
+                raise
             except (Error, OSError, ValueError, subprocess.SubprocessError):
                 raise PhotoFailure('decoder-failed') from None
             return 200, {'state': 'ready', 'jid': key, 'photo_revision': body.get('photo_revision', 0),
@@ -412,6 +420,9 @@ def main():
         status, body = execute(protocol.decode_json(raw))
         sys.stdout.write(json.dumps({'status': status, 'body': body}, ensure_ascii=True) + '\n')
         return 0
+    except (protocol.DeadlineError, TimeoutError):
+        sys.stdout.write('{"status":null,"body":{"state":"unavailable","reason":"worker-timeout","error":"Profile deadline exceeded; no automatic retry was made."}}\n')
+        return 1
     except PhotoFailure as exc:
         sys.stdout.write(json.dumps({'status': None, 'body': {'state': 'unavailable',
                           'reason': exc.reason, 'error': 'Profile unavailable; no message was sent.'}}) + '\n')

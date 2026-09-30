@@ -23,7 +23,8 @@ MAX_MEDIA = 24 * 1024 * 1024
 ROUTES = {
     "/health": set(),
     "/status": set(),
-    "/transport/status": set(),
+    "/transport/status": {"refresh"},
+    "/qr": set(),
     "/chats": {"v", "since"},
     "/chat": {"jid", "v", "read", "limit", "since"},
     "/media-job": {"id"},
@@ -92,6 +93,8 @@ def validate(spec: dict):
             raise ReadError("Invalid read query value.")
         if key == "v" and value != "2":
             raise ReadError("Unsupported read API version.")
+        if key == "refresh" and value != "1":
+            raise ReadError("Invalid transport refresh flag.")
         if key == "read" and value not in {"0", "1"}:
             raise ReadError("Invalid read acknowledgement flag.")
         if key == "limit" and (not value.isascii() or not value.isdecimal() or not 1 <= int(value) <= 10000):
@@ -109,6 +112,29 @@ def validate(spec: dict):
         raise ReadError("Invalid response byte limit.")
     return url, path, token, float(seconds), limit
 
+
+
+def media_failure(status, raw):
+    """Keep only typed provider status and constant categories, never error text."""
+    upstream = None
+    try:
+        obj = decode_json(raw)
+        value = obj.get("wuzapi_status") if isinstance(obj, dict) else None
+        if type(value) is int and 100 <= value <= 599:
+            upstream = value
+    except (ReadError, ValueError, TypeError, RecursionError):
+        pass
+    reason = {401: "bridge-auth", 403: "bridge-auth", 404: "bridge-route",
+              400: "media-metadata", 410: "media-expired", 413: "media-limit",
+              429: "media-busy"}.get(status, "media-provider")
+    if status == 502:
+        reason = {401: "provider-auth", 403: "provider-denied", 404: "provider-unavailable",
+                  405: "provider-route", 410: "media-expired", 429: "provider-busy"}.get(upstream, reason)
+    body = {"state": "unavailable", "reason": reason,
+            "error": "Media retrieval failed; no message was sent."}
+    if upstream is not None:
+        body["wuzapi_status"] = upstream
+    return body
 
 
 def read_request(spec: dict, *, raw_output: bool = False):
@@ -129,11 +155,14 @@ def read_request(spec: dict, *, raw_output: bool = False):
                            "Connection": "close"})
         with connection.getresponse() as response:
             status = response.status
-            if not 200 <= status < 300:
+            media_error = not 200 <= status < 300 and urlsplit(path).path == "/media-job"
+            if not 200 <= status < 300 and not media_error:
                 body = {"error": "Bridge read rejected; no redirect or retry was made."}
                 if raw_output:
                     return status, json.dumps(body, separators=(",", ":")).encode("utf-8")
                 return {"status": status, "body": body}
+            if media_error:
+                limit = min(limit, 65536)
             if response.getheader("Content-Encoding", "identity").lower() not in {"", "identity"}:
                 raise ReadError("Compressed bridge responses are not accepted.")
             lengths = response.headers.get_all("Content-Length", [])
@@ -149,7 +178,7 @@ def read_request(spec: dict, *, raw_output: bool = False):
             while True:
                 remaining = seconds - (time.monotonic() - start)
                 if remaining <= 0:
-                    raise ReadError("Bridge read deadline exceeded.")
+                    raise protocol.DeadlineError("Bridge read deadline exceeded.")
                 if connection.sock is not None:
                     connection.sock.settimeout(remaining)
                 block = response.read1(min(65536, limit + 1 - len(data)))
@@ -162,6 +191,11 @@ def read_request(spec: dict, *, raw_output: bool = False):
                 raise ReadError("Incomplete bridge response.")
             raw = bytes(data)
             del data
+            if media_error:
+                body = media_failure(status, raw)
+                if raw_output:
+                    return status, json.dumps(body, separators=(",", ":")).encode("utf-8")
+                return {"status": status, "body": body}
             body = decode_json(raw)
             route = urlsplit(path).path
             if route in {"/chat", "/chats"} and isinstance(body, dict) and body.get("version") != 2:
@@ -188,6 +222,7 @@ def write_envelope(stream, status: int, validated_raw: bytes) -> None:
 
 
 def main() -> int:
+    spec = None
     try:
         raw = sys.stdin.buffer.read(MAX_CONTROL + 1)
         if len(raw) > MAX_CONTROL:
@@ -198,6 +233,13 @@ def main() -> int:
             status, raw_reply = read_request(spec, raw_output=True)
         write_envelope(sys.stdout.buffer, status, raw_reply)
         return 0
+    except (protocol.DeadlineError, TimeoutError):
+        # Only fixed categories survive; deadlines never authorize a retry.
+        media = isinstance(spec, dict) and str(spec.get("path", "")).startswith("/media-job?")
+        sys.stdout.write(json.dumps({"status": None, "body": {
+            "state": "unavailable", "reason": "media-timeout" if media else "read-timeout",
+            "error": "Bridge read deadline exceeded; no automatic retry was made."}}) + "\n")
+        return 1
     except ReadError as exc:
         message = str(exc)
     except (OSError, ValueError, TypeError, RecursionError, http.client.HTTPException):

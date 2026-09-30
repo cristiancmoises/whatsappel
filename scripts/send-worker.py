@@ -60,9 +60,13 @@ def validate(spec):
         for key in ("reply_id", "reply_participant", "reply_text"):
             if key in payload and not valid_text(payload[key], 65536 if key == "reply_text" else 256):
                 raise ValueError("Invalid reply")
+    elif path == "/transport/connect":
+        if set(payload) != {"confirm"} or payload.get("confirm") is not True:
+            raise ValueError("Session connect requires confirmation")
     elif path == "/transport/repair":
-        if (set(payload) - {"confirm", "replace"} or payload.get("confirm") is not True or
-            ("replace" in payload and type(payload["replace"]) is not bool)):
+        if (set(payload) - {"confirm", "replace", "profiles"} or payload.get("confirm") is not True or
+            ("replace" in payload and type(payload["replace"]) is not bool) or
+            ("profiles" in payload and type(payload["profiles"]) is not bool)):
             raise ValueError("Callback repair requires confirmation")
     else: raise ValueError("Unsupported operation")
     return origin, token, timeout, path, payload
@@ -113,6 +117,11 @@ def execute(spec, opener=None):
             pass
         finally:
             exc.close()
+        if path.startswith("/transport/"):
+            reason = {401: "bridge-auth", 403: "bridge-auth", 404: "bridge-route",
+                      405: "bridge-route", 429: "transport-busy"}.get(code, "operation-unconfirmed")
+            return {"status": code, "body": {"reason": reason,
+                    "error": "Operation not confirmed; refresh the connection check. No automatic retry."}}
         if path == "/send/verified" and code in {404, 405, 501}:
             return {"status": code, "body": {"uncertain": True,
                     "error": "Verified send route unavailable. Install and activate the matching bridge before sending."}}
@@ -126,7 +135,7 @@ def execute(spec, opener=None):
         if upstream is not None:
             body["provider_http"] = upstream
         return {"status": code, "body": body}
-    except (protocol.ProtocolError, ValueError, OSError, TimeoutError, error.URLError, http.client.HTTPException):
+    except (protocol.ProtocolError, media.WorkerError, ValueError, OSError, TimeoutError, error.URLError, http.client.HTTPException):
         return {"status": None, "body": {"uncertain": True,
                 "error": "No reliable confirmation; request was not automatically resent."}}
 

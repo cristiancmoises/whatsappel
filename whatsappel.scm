@@ -347,8 +347,17 @@
                 (let ((id (record-id rec)))
                   (if id
                       (let ((old (hash-ref seen id '())))
-                        (hash-set! seen id (append rec (filter
-                          (lambda (entry) (not (assoc (car entry) rec))) old))))
+                        (let* ((merged (append rec (filter
+                                         (lambda (entry) (not (assoc (car entry) rec))) old)))
+                               (prior (jget old "delivery")))
+                          ;; A cached own-history echo cannot downgrade an observed
+                          ;; receipt. Identity scope is still the caller's one chat.
+                          (hash-set! seen id
+                            (if (and (eq? #t (jget old "me")) (eq? #t (jget merged "me"))
+                                     (> (receipt-rank prior) (receipt-rank (jget merged "delivery"))))
+                                (acons "delivery" prior
+                                       (filter (lambda (p) (not (equal? (car p) "delivery"))) merged))
+                                merged))))
                       (set! anonymous (cons rec anonymous)))))
               (append current incoming))
     (take-last (sort (hash-fold (lambda (id rec out) (cons rec out)) anonymous seen)
@@ -910,6 +919,19 @@
 ;; Ask the sender to re-upload expired media (best-effort, async). wuzapi's
 ;; whatsappel patch decrypts the response and refreshes the stored directPath;
 ;; a later /sync picks it up so the download then succeeds.
+(define (handle-archive body-str)
+  (let* ((o (safe-json-parse body-str)) (jid (jget o "jid"))
+         (field (and (list? o) (assoc "archive" o))))
+    (if (not (and (profile-jid? jid) field (boolean? (cdr field))
+                  (profile-unique-json? o 0) (= (length o) 2)))
+        (json-response 400 '(("error" . "expected a contact JID and boolean archive state")))
+        (let* ((raw (with-mutex *smutex* (hash-ref *rawjid* (normalize-jid jid) jid)))
+               (target (if (string-index raw #\@) raw (string-append raw "@s.whatsapp.net"))))
+          (if (not (profile-jid? target))
+              (json-response 400 '(("error" . "unsupported chat identity")))
+              (relay 'POST "/chat/archive"
+                     (list (cons "jid" target) (cons "archive" (cdr field)))))))))
+
 (define (handle-mediaretry body-str)
   (let* ((o  (safe-json-parse body-str))
          (id (and (pair? o) (assoc-ref o "id"))))
@@ -1107,13 +1129,14 @@
     (cond
      ((and (eq? method 'GET) (string=? path "/health"))
       (json-response 200 '(("status" . "ok") ("service" . "whatsappel") ("read_api" . 2) ("async_media" . #t)
-                            ("version" . "3.2.0-rc17") ("transport_api" . 1) ("verified_send" . 1))))
+                            ("version" . "3.3.0") ("transport_api" . 1) ("verified_send" . 1) ("session_connect" . 1))))
      ((and (eq? method 'POST) (ct-string=? path *hook-path*))
       (handle-webhook (webhook-body-string headers body)))
      ((not (authed? headers))
       (json-response 401 '(("error" . "unauthorized"))))
-     ((and (eq? method 'GET) (string=? path "/transport/status")) (handle-transport-status))
+     ((and (eq? method 'GET) (string=? path "/transport/status")) (handle-transport-status (equal? "1" (form-param query "refresh"))))
      ((and (eq? method 'POST) (string=? path "/transport/repair")) (handle-transport-repair body*))
+     ((and (eq? method 'POST) (string=? path "/transport/connect")) (handle-transport-connect body*))
      ((and (eq? method 'GET) (string=? path "/profile/capabilities")) (profile-capabilities))
      ((and (eq? method 'GET) (string=? path "/profiles")) (handle-profiles query))
      ((and (eq? method 'POST) (string=? path "/profile/request")) (start-profile-job body*))
@@ -1138,6 +1161,7 @@
      ((and (eq? method 'POST) (string=? path "/react"))    (handle-react body*))
      ((and (eq? method 'POST) (string=? path "/delete"))   (handle-delete body*))
      ((and (eq? method 'POST) (string=? path "/markread")) (handle-markread body*))
+     ((and (eq? method 'POST) (string=? path "/archive")) (handle-archive body*))
      ((and (eq? method 'POST) (string=? path "/mediaretry")) (handle-mediaretry body*))
      ((and (eq? method 'POST) (string=? path "/sync"))
       (let* ((o   (and (> (string-length body*) 0) (safe-json-parse body*)))

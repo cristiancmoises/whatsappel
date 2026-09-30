@@ -16,8 +16,8 @@ setup:
 check: check-client check-bridge check-python check-rust
 
 check-client:
-	emacs -Q --batch -L . -f batch-byte-compile whatsapp.el whatsapp-org.el whatsapp-profiles.el whatsapp-delivery.el
-	emacs -Q --batch -L . -L tests -l tests/client-tests.el -l tests/whatsapp-org-tests.el -l tests/workspace-tests.el -l tests/performance-tests.el -l tests/responsiveness-tests.el -l tests/navigation-tests.el -l tests/selection-tests.el -l tests/profiles-tests.el -l tests/delivery-tests.el -l tests/recipient-ui-tests.el -f ert-run-tests-batch-and-exit
+	emacs -Q --batch -L . -f batch-byte-compile whatsapp.el whatsapp-org.el whatsapp-profiles.el whatsapp-delivery.el whatsapp-tools.el
+	emacs -Q --batch -L . -L tests -l tests/client-tests.el -l tests/whatsapp-org-tests.el -l tests/workspace-tests.el -l tests/performance-tests.el -l tests/responsiveness-tests.el -l tests/navigation-tests.el -l tests/selection-tests.el -l tests/profiles-tests.el -l tests/delivery-tests.el -l tests/recipient-ui-tests.el -l tests/repair-tests.el -l tests/media-profile-repair-tests.el -l tests/session-recovery-tests.el -l tests/reliability-tests.el -l tests/tools-tests.el -f ert-run-tests-batch-and-exit
 
 check-bridge:
 	guile --no-auto-compile tests/bridge-tests.scm

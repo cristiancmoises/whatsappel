@@ -127,6 +127,20 @@ def launch_command(root, executable, quick=False):
     return [executable, *(["-Q"] if quick else []), "--name", "WhatsAppel", "--title", "WhatsAppel", "--eval", expression]
 
 
+def guix_pixbuf_environment(environment, executable):
+    """Keep a Guix profile's image loaders with its selected Emacs.
+
+    Combining Home and system caches can load an SVG module against an
+    incompatible librsvg already linked into Emacs. Other processes retain
+    their environment; no Guix profile or global shell setting is changed.
+    """
+    result = dict(environment)
+    cache = Path(executable).parent.parent / 'lib/gdk-pixbuf-2.0/2.10.0/loaders.cache'
+    if result.get('GUIX_GDK_PIXBUF_MODULE_FILES') and cache.is_file():
+        result['GUIX_GDK_PIXBUF_MODULE_FILES'] = str(cache)
+    return result
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true")
@@ -142,7 +156,7 @@ def main(argv=None):
     if args.check:
         print("Launcher ready; bridge token " + ("available from environment/.env" if env.get("WHATSAPPEL_TOKEN") else "must come from existing Emacs init or setup"))
         return 0
-    os.execve(emacs, launch_command(root, emacs, args.quick), env)
+    os.execve(emacs, launch_command(root, emacs, args.quick), guix_pixbuf_environment(env, emacs))
 
 if __name__ == "__main__":
     try:

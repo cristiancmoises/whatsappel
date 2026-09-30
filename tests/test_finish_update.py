@@ -314,6 +314,21 @@ class Sequencing(unittest.TestCase):
 
 
 class ActualCLI(unittest.TestCase):
+    def test_stable_release_passes_version_validation(self):
+        path = self.bundle / 'manifest.json'
+        manifest = json.loads(path.read_text())
+        manifest['version'] = '3.3.0'
+        path.write_text(json.dumps(manifest))
+        (self.bundle / 'SHA256SUMS').write_text(''.join(
+            hashlib.sha256((self.bundle / name).read_bytes()).hexdigest() + '  ' + name + '\n'
+            for name in ('manifest.json', 'payload/whatsappel.scm')))
+        process = self.run_cli('--check')
+        self.assertEqual(process.returncode, 2, process.stdout + process.stderr)
+        report = json.loads((self.root / 'report.json').read_text())
+        self.assertEqual(report['expected_version'], '3.3.0')
+        self.assertNotEqual(report['phase'], 'preflight')
+        self.assertFalse(report['runtime_verified'])
+
     """Actual CLI subprocess with a tiny verified fixture package and local HTTP."""
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)

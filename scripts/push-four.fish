@@ -11,7 +11,7 @@ function whatsappel_push_four
     set -l script_dir (dirname (status --current-filename))
     set -l bundle (realpath "$script_dir/..")
     or return 1
-    set -l worktree "$HOME/whatsappel-publish-3.2.0-rc17"
+    set -l worktree "$HOME/whatsappel-publish-3.3.0"
     if test (count $argv) -gt 0; and not string match -q -- '-*' "$argv[1]"
         set worktree "$argv[1]"
         set -e argv[1]

@@ -5,7 +5,7 @@
 ;;
 ;; Author: Cristian Cezar Moisés
 ;; URL: https://codeberg.org/berkeley/whatsappel
-;; Version: 3.2.0pre17
+;; Version: 3.3.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: comm, whatsapp
 
@@ -136,7 +136,7 @@ old captured envelopes; tolerates clock skew and delayed delivery."
 (defvar-local whatsapp-chat--reply nil
   "Pending reply target: plist (:id :participant :text :who), or nil.")
 
-(defconst whatsapp-version "3.2.0-rc17" "Workspace release candidate version.")
+(defconst whatsapp-version "3.3.0" "Workspace release version.")
 
 (defconst whatsapp--source-directory
   (file-name-directory (or load-file-name buffer-file-name default-directory)))
@@ -264,9 +264,13 @@ The token is sent only on stdin. Killing the originating buffer stops the child.
   (let* ((buffer (current-buffer)) (origin (whatsapp--origin-key))
          (process-environment (whatsapp--media-environment))
          (python (executable-find whatsapp-python-program))
-         (script (expand-file-name (if payload "scripts/send-worker.py" "scripts/read-worker.py")
+         (media-submit (member path '("/download" "/download?async=1")))
+         (script (expand-file-name (cond (media-submit "scripts/download-worker.py")
+                                         (payload "scripts/send-worker.py")
+                                         (t "scripts/read-worker.py"))
                                    whatsapp--source-directory))
-         (ceiling (if payload 65536 (* (if (string-prefix-p "/media-job?" path) 24 4) 1024 1024)))
+         (ceiling (if media-submit (* 24 1024 1024)
+                    (if payload 65536 (* (if (string-prefix-p "/media-job?" path) 24 4) 1024 1024))))
          (timeout (max 1 (min 120 whatsapp-request-timeout)))
          (size 0) chunks done timer proc)
     (unless (and python (file-regular-p script))
@@ -324,10 +328,10 @@ The token is sent only on stdin. Killing the originating buffer stops the child.
 (defun whatsapp--request-async (method path payload callback)
   "Use strict owned workers for snapshots and explicit text sends; never resend."
   (cond
-   ((and (equal method "POST") (member path '("/send" "/send/verified" "/transport/repair")))
+   ((and (equal method "POST") (member path '("/send" "/send/verified" "/transport/repair" "/transport/connect" "/download" "/download?async=1")))
     (whatsapp--read-worker path callback payload))
    ((and whatsapp-use-read-worker (equal method "GET")
-         (or (member path '("/status" "/transport/status"))
+         (or (member path '("/status" "/qr" "/transport/status" "/transport/status?refresh=1"))
              (string-match-p "\\`/\\(?:chats\\|chat\\|health\\|media-job\\)\\(?:[?]\\|\\'\\)" path)))
     (whatsapp--read-worker path callback))
    (t (whatsapp--url-request-async method path payload callback))))
@@ -357,12 +361,13 @@ The token is sent only on stdin. Killing the originating buffer stops the child.
 
 (defun whatsapp--status-label ()
   "Return a non-secret loading/cache status for the visible header."
-  (cond (whatsapp--last-error (concat " " whatsapp--last-error))
+  (concat (if (fboundp 'whatsapp-session-label) (whatsapp-session-label) "")
+   (cond (whatsapp--last-error (concat " " whatsapp--last-error))
         (whatsapp--refresh-pending (if whatsapp--has-snapshot " Refreshing · cached messages remain usable" " Loading from bridge…"))
         (whatsapp--has-snapshot
          (format " Cached snapshot · refreshed %ss ago"
                  (max 0 (floor (- (float-time) (or whatsapp--last-refresh-time (float-time)))))))
-        (t " Waiting for the first successful bridge read")))
+        (t " Waiting for the first successful bridge read"))))
 
 (defun whatsapp-chat--focused-p ()
   "Non-nil only for the selected window in a visibly focused frame."
@@ -611,6 +616,34 @@ a GIF file is never mislabeled as an MP4. Looping and codecs depend on upstream.
   (setq whatsapp--media-order nil)
   (message "WhatsApp caches cleared"))
 
+(defun whatsapp--media-failure-label (result)
+  "Return an actionable constant label, never a raw server error or URL."
+  (let* ((status (car-safe result))
+         (body (cdr-safe result))
+         (reason (and (proper-list-p body) (cdr (assoc "reason" body))))
+         (provider (and (proper-list-p body) (cdr (assoc "wuzapi_status" body)))))
+    (cond
+     ((or (member reason '("bridge-auth")) (memq status '(401 403)))
+      "Bridge authentication failed; check the selected account/token")
+     ((or (equal reason "bridge-route") (memq status '(404 405)))
+      "Media route or job unavailable; verify the running bridge version")
+     ((or (equal reason "media-metadata") (eq status 400))
+      "Download metadata incomplete or rejected; refresh this chat before retrying")
+     ((or (equal reason "media-limit") (eq status 413))
+      "Media exceeds a configured size limit")
+     ((or (member reason '("media-busy" "provider-busy")) (eq status 429))
+      "Media workers are busy; wait, then retry explicitly")
+     ((or (equal reason "provider-auth") (eq provider 401))
+      "wuzapi rejected its user token; check backend account configuration")
+     ((or (equal reason "provider-denied") (eq provider 403))
+      "Provider denied this media request; check session and media availability")
+     ((or (equal reason "media-expired") (eq status 410) (eq provider 410))
+      "Provider reports expired media; old content may no longer be downloadable")
+     ((equal reason "media-timeout") "Media request timed out; no message was resent")
+     ((eq status 502) "Provider could not download this media; inspect Connection / delivery")
+     ((whatsapp--ok-p status) "Media reply contains no supported data URI; check provider compatibility")
+     (t "Media retrieval failed; check bridge connectivity and the Python worker"))))
+
 (defun whatsapp--download-uri (result)
   "Extract a data URI from a successful bridge RESULT."
   (when (whatsapp--ok-p (car result))
@@ -723,7 +756,7 @@ a GIF file is never mislabeled as an MP4. Looping and codecs depend on upstream.
         (when (and (= (cadr waiter) whatsapp--media-open-generation)
                    (eq (window-buffer (selected-window)) (current-buffer)))
           (let ((uri (whatsapp--download-uri result)))
-            (if (not uri) (message "WhatsApp: media unavailable; explicitly retry after checking the connection")
+            (if (not uri) (message "WhatsApp: %s" (whatsapp--media-failure-label result))
               (condition-case nil
                   (whatsapp--open-uri uri (nth 4 key))
                 (error (message "WhatsApp: preview unavailable; check Settings → Video or use Save original"))))))))))
@@ -1722,7 +1755,10 @@ The document transport avoids WhatsApp's photo recompression."
                ("Send draft" . whatsapp-chat-send-input)
                ("Message actions…" . whatsapp-chat-message-menu)
                ("Refresh conversation" . whatsapp-chat-refresh)))
-           '(("Open conversation…" . whatsapp-open-chat)
+           '(("Conversation tools…" . whatsapp-chat-tools)
+             ("Archived conversations" . whatsapp-show-archived)
+             ("Profile diagnostics" . whatsapp-profile-diagnostics)
+             ("Open conversation…" . whatsapp-open-chat)
              ("All conversations" . whatsapp) ("Connect account" . whatsapp-connect)
              ("Show linking QR" . whatsapp-qr) ("Connection status" . whatsapp-status)
              ("Toggle automatic refresh" . whatsapp-toggle-polling)
@@ -1896,7 +1932,7 @@ network lookup.  C-g cancels without touching the current draft."
     (when chat (whatsapp-open-chat (cdr (assoc "jid" chat))))))
 
 (defun whatsapp-root-set-filter (filter)
-  "Show chats matching FILTER: all, unread, groups, or non-group direct chats."
+  "Show chats matching FILTER: all, unread, pinned, groups, direct or archived."
   (setq whatsapp-root--filter filter whatsapp-root--limit nil)
   (whatsapp-root--render whatsapp--chats))
 
@@ -1908,7 +1944,11 @@ network lookup.  C-g cancels without touching the current draft."
 
 (defun whatsapp-root--visible-p (chat)
   "Whether CHAT matches the active dashboard filters."
-  (and (pcase whatsapp-root--filter
+  (and (if (eq whatsapp-root--filter 'archived)
+           (whatsapp-tools--flag (cdr (assoc "jid" chat)) :archived)
+         (not (whatsapp-tools--flag (cdr (assoc "jid" chat)) :archived)))
+       (pcase whatsapp-root--filter
+         ('pinned (whatsapp-tools--flag (cdr (assoc "jid" chat)) :pinned))
          ('unread (> (or (cdr (assoc "unread" chat)) 0) 0))
          ('groups (string-suffix-p "@g.us" (or (cdr (assoc "jid" chat)) "")))
          ('direct (not (string-suffix-p "@g.us" (or (cdr (assoc "jid" chat)) ""))))
@@ -1930,7 +1970,8 @@ network lookup.  C-g cancels without touching the current draft."
   (let* ((beg (point)) (jid (cdr (assoc "jid" c)))
                (name (whatsapp--row-text (or (cdr (assoc "name" c)) jid "Unknown")))
                (unread (or (cdr (assoc "unread" c)) 0))
-               (badge (if (> unread 0) (format " [%s]" (if (> unread 999) "999+" unread)) ""))
+         (badge (concat (when (whatsapp-tools--flag jid :pinned) " ★")
+                        (if (> unread 0) (format " [%s]" (if (> unread 999) "999+" unread)) "")))
                (time (whatsapp--fmt-ts (cdr (assoc "ts" c)))))
           (when (fboundp 'whatsapp-profiles--insert-avatar) (whatsapp-profiles--insert-avatar jid))
           (insert (propertize (truncate-string-to-width name (max 8 (- width 5 (length badge))) nil nil "…")
@@ -1977,7 +2018,7 @@ network lookup.  C-g cancels without touching the current draft."
 
 (defun whatsapp-root--update (chats)
   "Replace changed rows only when ordering, filters and layout are unchanged."
-  (let* ((matching (cl-remove-if-not #'whatsapp-root--visible-p chats))
+  (let* ((matching (whatsapp-tools--ordered (cl-remove-if-not #'whatsapp-root--visible-p chats)))
          (limit (max 1 (or whatsapp-root--limit whatsapp-root-page-size)))
          (visible (cl-subseq matching 0 (min limit (length matching))))
          (window (get-buffer-window (current-buffer) t))
@@ -2031,7 +2072,7 @@ network lookup.  C-g cancels without touching the current draft."
   (let* ((inhibit-read-only t)
          (jid-at-point (get-text-property (point) 'whatsapp-jid))
          (old-point (point))
-         (matching (cl-remove-if-not #'whatsapp-root--visible-p chats))
+         (matching (whatsapp-tools--ordered (cl-remove-if-not #'whatsapp-root--visible-p chats)))
          (limit (max 1 (or whatsapp-root--limit whatsapp-root-page-size)))
          (visible (cl-subseq matching 0 (min limit (length matching))))
          (window (get-buffer-window (current-buffer) t))
@@ -2047,12 +2088,14 @@ network lookup.  C-g cancels without touching the current draft."
     (whatsapp--button "New" #'whatsapp-open-chat)
     (whatsapp--button "Refresh" #'whatsapp-root-refresh)
     (whatsapp--button "Settings" #'whatsapp-profile-settings)
+    (whatsapp--button "Commands" #'whatsapp-command-menu)
     (whatsapp--button "Check delivery" #'whatsapp-connection-panel)
     (insert "\n")
     (whatsapp--button (if whatsapp-root--compact "Detailed rows" "Compact rows")
                       #'whatsapp-root-toggle-density)
     (insert "\n")
-    (dolist (item '((all . "All") (unread . "Unread") (direct . "Direct") (groups . "Groups")))
+    (dolist (item '((all . "Inbox") (unread . "Unread") (pinned . "Pinned")
+                    (direct . "Direct") (groups . "Groups") (archived . "Archived")))
       (let ((filter (car item)))
         (insert-text-button (format " %s " (cdr item)) 'follow-link t
                             'face (if (eq filter whatsapp-root--filter) 'whatsapp-accent 'button)
@@ -2078,7 +2121,7 @@ network lookup.  C-g cancels without touching the current draft."
       (insert-text-button (format "More chats (%d remaining)" (- (length matching) (length visible)))
                           'follow-link t 'action (lambda (_b) (whatsapp-root-show-more)))
       (insert "\n"))
-    (insert (propertize "\nn/p navigate · Enter opens\n/ searches · j switches · d density\n? more actions\n" 'face 'shadow))
+    (insert (propertize "\nn/p navigate · Enter opens\n/ searches · j switches · d density\na archive/restore · P pin · m chat tools\n? commands · i contact photo\n" 'face 'shadow))
     (goto-char (or (and jid-at-point (whatsapp-root--chat-position jid-at-point)) (min old-point (point-max)))))
   (set-buffer-modified-p nil))
 
@@ -2097,7 +2140,10 @@ network lookup.  C-g cancels without touching the current draft."
 (defun whatsapp-next-unread ()
   "Open the next unread chat from the cached list, without synchronous lookup."
   (interactive)
-  (let* ((unread (cl-remove-if-not (lambda (c) (> (or (cdr (assoc "unread" c)) 0) 0)) whatsapp--chats))
+  (let* ((unread (cl-remove-if-not
+                  (lambda (c) (and (> (or (cdr (assoc "unread" c)) 0) 0)
+                                   (not (whatsapp-tools--flag (cdr (assoc "jid" c)) :archived))))
+                  whatsapp--chats))
          (at (cl-position whatsapp-chat--jid unread :key (lambda (c) (cdr (assoc "jid" c))) :test #'equal))
          (next (and unread (nth (if at (mod (1+ at) (length unread)) 0) unread))))
     (unless next (user-error "No unread cached conversations"))
@@ -2115,6 +2161,7 @@ network lookup.  C-g cancels without touching the current draft."
   (interactive)
   (with-current-buffer (whatsapp--root-buffer)
     (when (= (buffer-size) 0) (whatsapp-root--render whatsapp--chats))
+    (when (fboundp 'whatsapp-session-refresh) (whatsapp-session-refresh))
     (whatsapp--refresh (whatsapp--conditional-path "/chats?v=2")
                        (lambda (chats) (setq whatsapp--chats chats)
                          (whatsapp-root--update chats)
@@ -2198,20 +2245,15 @@ network lookup.  C-g cancels without touching the current draft."
 
 ;;;###autoload
 (defun whatsapp-connect ()
-  "Connect the wuzapi session and register the inbound webhook."
+  "Open session recovery; connect is a separately confirmed action in the panel."
   (interactive)
-  (let* ((res (whatsapp--request "POST" "/connect"))
-         (data (cdr res))
-         (reg (and (listp data) (cdr (assoc "webhook_registered" data)))))
-    (unless (whatsapp--ok-p (car res)) (user-error "Connection request failed"))
-    (message "whatsapp: connect requested%s. If not logged in, run M-x whatsapp-qr"
-             (if (eq reg t) " (webhook registered)" ""))))
+  (whatsapp-connection-panel))
 
 ;;;###autoload
 (defun whatsapp-status ()
-  "Show connection/login status from the bridge."
+  "Show redacted account-scoped connection status, never raw provider credentials."
   (interactive)
-  (message "whatsapp status: %S" (cdr (whatsapp--request "GET" "/status"))))
+  (whatsapp-connection-panel))
 
 ;;;###autoload
 (defun whatsapp-logout ()
@@ -2224,29 +2266,41 @@ network lookup.  C-g cancels without touching the current draft."
 
 ;;;###autoload
 (defun whatsapp-qr ()
-  "Fetch and display the linking QR code from wuzapi."
+  "Fetch a linking QR asynchronously for this account; never save it to disk."
   (interactive)
-  (let* ((res   (whatsapp--request "GET" "/qr"))
-         (data  (cdr res))
-         (wj    (and (listp data) (cdr (assoc "data" data))))
-         (wd    (and (listp wj) (cdr (assoc "data" wj))))
-         (qr    (and (listp wd) (cdr (assoc "QRCode" wd)))))
-    (unless (stringp qr)
-      (user-error "No QR returned (already logged in? run M-x whatsapp-status): %S"
-                  data))
-    (let* ((b64 (if (string-match ",\\(.*\\)\\'" qr) (match-string 1 qr) qr))
-           (png (base64-decode-string b64)))
-      (with-current-buffer (get-buffer-create "*whatsapp-qr*")
-        (let ((inhibit-read-only t))
-          (erase-buffer)
-          (if (image-type-available-p 'png)
-              (insert-image (create-image png 'png t))
-            (let ((f (make-temp-file "whatsapp-qr" nil ".png")))
-              (let ((coding-system-for-write 'binary))
-                (with-temp-file f (set-buffer-multibyte nil) (insert png)))
-              (insert (format "QR (no inline image) saved to:\n%s\nOpen and scan." f)))))
-        (special-mode)
-        (display-buffer (current-buffer))))))
+  (unless (and (display-graphic-p) (image-type-available-p 'png))
+    (user-error "Use graphical Emacs with PNG support to display a private pairing QR"))
+  (let ((origin (whatsapp--origin-key)))
+    (whatsapp--request-async
+     "GET" "/qr" nil
+     (lambda (result)
+       (when (equal origin (whatsapp--origin-key))
+         (condition-case nil
+             (let* ((top (cdr result))
+                    (provider (and (proper-list-p top) (cdr (assoc "data" top))))
+                    (data (and (proper-list-p provider) (cdr (assoc "data" provider))))
+                    (qr (and (proper-list-p data) (cdr (assoc "QRCode" data)))))
+               (unless (and (whatsapp--ok-p (car result)) (stringp qr)
+                            (<= (length qr) (* 512 1024)))
+                 (error "QR unavailable"))
+               (let* ((b64 (string-remove-prefix "data:image/png;base64," qr))
+                      (png (base64-decode-string b64))
+                      (image (and (<= 24 (length png) (* 384 1024))
+                                  (string-prefix-p (unibyte-string 137 80 78 71 13 10 26 10) png)
+                                  (<= 1 (whatsapp--uint png 16 4 nil) 2048)
+                                  (<= 1 (whatsapp--uint png 20 4 nil) 2048)
+                                  (create-image png 'png t))))
+                 (unless image (error "Invalid QR image"))
+                 (with-current-buffer (get-buffer-create "*whatsapp-qr*")
+                   (let ((inhibit-read-only t))
+                     (erase-buffer)
+                     (insert "Private linking QR — scan with WhatsApp Linked Devices.\n\n")
+                     (insert-image image))
+                   (buffer-disable-undo)
+                   (setq-local buffer-offer-save nil)
+                   (special-mode)
+                   (display-buffer (current-buffer)))))
+           (error (message "No usable QR returned. Check the session panel; connect first if disconnected. No credentials were printed."))))))))
 
 (defvar whatsapp-prefix-map
   (let ((map (make-sparse-keymap)))
@@ -2687,8 +2741,9 @@ sends a WhatsApp message. A failure or timeout is never retried automatically."
                       (let* ((type (whatsapp--image-type-from-mime (whatsapp--data-uri-mime uri)))
                              (image (and type (image-type-available-p type)
                                          (whatsapp--preview-image key uri type kind))))
-                        (if image (put-text-property p end 'display image)
-                          (put-text-property p end 'whatsapp-preview-failed t)))
+                        (with-silent-modifications
+                          (if image (put-text-property p end 'display image)
+                            (put-text-property p end 'whatsapp-preview-failed t))))
                     (error (put-text-property p end 'whatsapp-preview-failed t)))))
               (setq p end)))))
       (set-buffer-modified-p modified)
@@ -3244,6 +3299,7 @@ No account linking or microphone recording occurs automatically."
 ;; Its hooks register the native UI; loading it never initiates network work.
 (load (expand-file-name "whatsapp-profiles.el" whatsapp--source-directory) nil t)
 (load (expand-file-name "whatsapp-delivery.el" whatsapp--source-directory) nil t)
+(load (expand-file-name "whatsapp-tools.el" whatsapp--source-directory) nil t)
 
 (provide 'whatsapp)
 ;;; whatsapp.el ends here

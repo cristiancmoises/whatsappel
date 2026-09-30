@@ -3,11 +3,29 @@ import importlib.util
 import os
 from pathlib import Path
 import unittest
+import tempfile
 from unittest import mock
 spec=importlib.util.spec_from_file_location('launcher',Path(__file__).resolve().parents[1]/'scripts/launch-whatsappel.py')
 launcher=importlib.util.module_from_spec(spec);spec.loader.exec_module(launcher)
 
 class QuickLaunchTests(unittest.TestCase):
+    def test_guix_launcher_uses_selected_profile_image_loaders(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory)
+            cache = profile / 'lib/gdk-pixbuf-2.0/2.10.0/loaders.cache'
+            cache.parent.mkdir(parents=True)
+            cache.write_text('fixture loader cache')
+            original = {'GUIX_GDK_PIXBUF_MODULE_FILES': '/home-cache:/system-cache',
+                        'WHATSAPPEL_TOKEN': 'fixture-private-account'}
+            selected = launcher.guix_pixbuf_environment(original, str(profile / 'bin/emacs'))
+            self.assertEqual(selected['GUIX_GDK_PIXBUF_MODULE_FILES'], str(cache))
+            self.assertEqual(selected['WHATSAPPEL_TOKEN'], 'fixture-private-account')
+            self.assertEqual(original['GUIX_GDK_PIXBUF_MODULE_FILES'], '/home-cache:/system-cache')
+
+    def test_non_guix_launcher_preserves_image_configuration(self):
+        original = {'GUIX_GDK_PIXBUF_MODULE_FILES': '/existing/cache'}
+        self.assertEqual(launcher.guix_pixbuf_environment(original, '/nonexistent/emacs'), original)
+
     def test_default_keeps_user_init(self):
         self.assertNotIn('-Q',launcher.launch_command(Path('/tmp/source'),'/usr/bin/emacs'))
     def test_quick_mode_uses_q_without_shell(self):

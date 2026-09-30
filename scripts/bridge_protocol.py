@@ -16,6 +16,10 @@ class ProtocolError(Exception):
     """Fixed diagnostics only: never interpolate URLs, headers or bodies."""
 
 
+class DeadlineError(ProtocolError):
+    """A wall-clock deadline, distinguishable without parsing exception text."""
+
+
 def reject_constant(_value):
     raise ProtocolError("Non-finite JSON numbers are not supported.")
 
@@ -153,7 +157,7 @@ def overall_deadline(seconds: float):
         yield
         return
     def expired(_signum, _frame):
-        raise ProtocolError("Bridge operation deadline exceeded.")
+        raise DeadlineError("Bridge operation deadline exceeded.")
     started = time.monotonic()
     previous_handler = signal.getsignal(signal.SIGALRM)
     previous_delay, previous_interval = signal.getitimer(signal.ITIMER_REAL)

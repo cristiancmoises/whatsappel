@@ -230,28 +230,123 @@ Unconfirmed notes should be checked against the recipient before retrying a draf
     (setq whatsapp-chat--outgoing nil)
     (whatsapp-chat--paint-outgoing)))
 
+;; Session observations are account-scoped and are never inferred from chat cache.
+(defvar whatsapp--session-snapshot nil)
+(defvar-local whatsapp--session-pending nil)
+(defvar-local whatsapp--session-requested-at 0)
+(defvar-local whatsapp--session-request-origin nil)
+
+(defun whatsapp-session-observe (data origin)
+  "Store only a fresh, typed backend observation for the currently selected account."
+  (when (equal origin (whatsapp--origin-key))
+    (let* ((age (and (proper-list-p data) (cdr (assoc "checked_age" data))))
+           (state (and (proper-list-p data) (cdr (assoc "session_state" data))))
+           (old (and (equal origin (plist-get whatsapp--session-snapshot :origin))
+                     (or (plist-get whatsapp--session-snapshot :last-completed-state)
+                         (plist-get whatsapp--session-snapshot :state))))
+           (fresh (and (integerp age) (<= 0 age 45)
+                       (null (cdr (assoc "checking" data)))
+                       (eq t (cdr (assoc "checked" data)))
+                       (member state '("ready" "disconnected" "pairing-required"
+                                       "authentication-required" "provider-unavailable" "unknown")))))
+      (setq whatsapp--session-snapshot
+            (list :origin origin :state (if fresh state "unknown")
+                  ;; A pending check cannot advertise readiness, but must not erase
+                  ;; the completed state needed for one later recovery transition.
+                  :last-completed-state (if fresh state old)
+                  :expires (+ (float-time) (if fresh (max 0 (- 45 age)) 0))))
+      (when (and fresh (equal state "ready")
+                 (member old '("disconnected" "pairing-required" "provider-unavailable"))
+                 (fboundp 'whatsapp-profiles-session-recovered))
+        (whatsapp-profiles-session-recovered))
+      (force-mode-line-update t))))
+
+(defun whatsapp-session-label ()
+  "Return the backend state without exposing credentials or asserting delivery."
+  (let ((state (and (equal (plist-get whatsapp--session-snapshot :origin) (whatsapp--origin-key))
+                    (> (or (plist-get whatsapp--session-snapshot :expires) 0) (float-time))
+                    (plist-get whatsapp--session-snapshot :state))))
+    (concat " " (pcase state
+                  ("ready" "Backend connected")
+                  ("disconnected" "Backend disconnected — Check delivery")
+                  ("pairing-required" "Backend awaiting login — Open linking QR")
+                  ("authentication-required" "Backend token rejected")
+                  ("provider-unavailable" "Backend unavailable")
+                  (_ "Backend status unverified")) " |")))
+
+(defun whatsapp-session-refresh ()
+  "Read backend state at most once per 15 seconds; cached chats stay responsive."
+  (let ((origin (whatsapp--origin-key)) (now (float-time)))
+    (unless (equal origin whatsapp--session-request-origin)
+      (setq whatsapp--session-request-origin origin
+            whatsapp--session-requested-at 0 whatsapp--session-pending nil))
+    (when (and (not whatsapp--session-pending)
+               (>= (- now whatsapp--session-requested-at) 15))
+      (let ((buffer (current-buffer)) (cookie (list origin now)))
+        (setq whatsapp--session-pending cookie whatsapp--session-requested-at now)
+        (condition-case nil
+            (whatsapp--request-async
+             "GET" "/transport/status" nil
+             (lambda (result)
+               (when (buffer-live-p buffer)
+                 (with-current-buffer buffer
+                   (when (eq cookie whatsapp--session-pending)
+                     (setq whatsapp--session-pending nil)
+                     (whatsapp-session-observe
+                      (and (whatsapp--ok-p (car-safe result)) (cdr-safe result)) origin))))))
+          (error
+           (setq whatsapp--session-pending nil)
+           (whatsapp-session-observe nil origin)))))))
+
 (defvar-local whatsapp--transport-origin nil)
 (defvar-local whatsapp--transport-timer nil)
 (defvar-local whatsapp--transport-pending nil)
 (defvar-local whatsapp--transport-data nil)
 (defvar-local whatsapp--transport-round 0)
+(defvar-local whatsapp--transport-generation 0)
+(defvar-local whatsapp--transport-watch-until 0)
+
 (defun whatsapp--transport-stop ()
+  (cl-incf whatsapp--transport-generation)
   (when (timerp whatsapp--transport-timer) (cancel-timer whatsapp--transport-timer))
-  (setq whatsapp--transport-timer nil)
+  (setq whatsapp--transport-timer nil whatsapp--transport-pending nil
+        whatsapp--transport-watch-until 0)
   (whatsapp--cancel-buffer-work))
+
+(defun whatsapp--transport-current-p (origin generation)
+  (and (not whatsapp--closing) (= generation whatsapp--transport-generation)
+       (equal origin whatsapp--transport-origin) (equal origin (whatsapp--origin-key))))
+
 (defun whatsapp--transport-render (&optional failure)
-  "Render only redacted, typed diagnostic fields. Never insert raw provider JSON."
+  "Render constant guidance and typed fields, not raw provider JSON."
   (let ((inhibit-read-only t) (data whatsapp--transport-data))
     (erase-buffer)
     (insert "WhatsAppel · connection and delivery\n\n")
     (whatsapp--button "Refresh check" #'whatsapp-connection-refresh)
+    (whatsapp--button "Connect existing session…" #'whatsapp-connection-connect)
+    (whatsapp--button "Open linking QR" #'whatsapp-qr)
+    (insert "\n")
     (whatsapp--button "Repair incoming callback…" #'whatsapp-repair-incoming)
+    (whatsapp--button "Enable profile events…" #'whatsapp-repair-profile-events)
     (whatsapp--button "Close" #'quit-window)
     (insert "\n\nCached conversations do NOT prove a connected phone session or live incoming delivery.\n")
     (insert "Accepted = upstream accepted an ID. Delivered/Read require a matching receipt.\n\n")
-    (when failure (insert "Check unavailable. Verify the updated running bridge; no message was sent.\n"))
+    (when failure (insert "Check unavailable; verify the running bridge and account. No message was sent.\n"))
+    (insert (if (eq t (cdr (assoc "checking" data)))
+                "Checking backend; any retained fields below are previous observations.\n"
+              (pcase (cdr (assoc "session_state" data))
+              ("disconnected" "Next: Connect existing session. If WhatsApp requires login, open the linking QR.\n")
+              ("pairing-required" "Next: Open linking QR and scan it from WhatsApp → Linked Devices.\n")
+              ("authentication-required" "Next: verify this backend account token privately; do not reset the session.\n")
+              ("provider-unavailable" "Next: verify the backend process and URL. A running bridge alone is insufficient.\n")
+              ("ready" "Backend connected and logged in. Now verify events and test one recent image.\n")
+              (_ "Backend status is unverified. Refresh check before changing session settings.\n"))))
+    (insert "\n")
     (dolist (item '(("Connection" . "connection_state") ("Login" . "login_state")
-                    ("Incoming callback" . "callback_state") ("Message subscription" . "subscription_state")))
+                    ("Incoming callback" . "callback_state") ("Message subscription" . "subscription_state")
+                    ("Presence events" . "presence_subscription_state")
+                    ("Typing/recording events" . "activity_subscription_state")
+                    ("Profile picture events" . "picture_subscription_state")))
       (let ((value (cdr (assoc (cdr item) data))))
         (insert (car item) ": " (if (member value '("yes" "no" "unknown")) value "unknown") "\n")))
     (dolist (item '(("Webhook events observed" . "webhooks_seen")
@@ -259,71 +354,134 @@ Unconfirmed notes should be checked against the recipient before retrying a draf
                     ("Seconds since last incoming message event" . "last_message_age")))
       (let ((value (cdr (assoc (cdr item) data))))
         (insert (car item) ": " (if (and (integerp value) (>= value 0)) (number-to-string value) "unknown") "\n")))
-    (let ((repair (cdr (assoc "repair" data))))
+    (let ((repair (cdr (assoc "repair" data))) (connect (cdr (assoc "connect_result" data))))
       (when (member repair '("unsupported-webhook-schema" "different-callback-confirmation-required"
                             "unconfirmed-no-automatic-retry" "registered-not-reachability-tested" "verification-failed"))
-        (insert "\nRepair result: " repair "\n")))
-    (insert "\nNo automatic connect, logout, pairing, message send, or callback replacement.\n")
-    (when (cdr (assoc "checking" data)) (insert "Checking provider asynchronously…\n"))
+        (insert "\nCallback result: " repair "\n"))
+      (when (member connect '("already-connected" "pairing-required" "status-unverified-no-connect"
+                              "subscriptions-unverified-no-connect" "requested-check-status"
+                              "already-started-check-status" "unconfirmed-no-automatic-retry"))
+        (insert "\nConnect result: " connect "\n")))
+    (insert "\nConnect, callback registration and per-contact Presence consent are separate choices.\n")
+    (insert "No automatic connect, logout, pairing, message send, or callback replacement.\n")
+    (when (eq t (cdr (assoc "checking" data))) (insert "Checking provider asynchronously…\n"))
     (goto-char (point-min))))
-(defun whatsapp--transport-fetch ()
+
+(defun whatsapp--transport-fetch (&optional fresh)
   (setq whatsapp--transport-timer nil)
   (when (and (not whatsapp--transport-pending) (not whatsapp--closing)
              (equal whatsapp--transport-origin (whatsapp--origin-key)))
-    (setq whatsapp--transport-pending t)
-    (let ((buffer (current-buffer)))
-      (whatsapp--request-async
-       "GET" "/transport/status" nil
-       (lambda (result)
-         (when (buffer-live-p buffer)
-           (with-current-buffer buffer
-             (setq whatsapp--transport-pending nil)
-             (when (and (not whatsapp--closing) (equal whatsapp--transport-origin (whatsapp--origin-key)))
-               (setq whatsapp--transport-data (and (whatsapp--ok-p (car result)) (cdr result)))
-               (whatsapp--transport-render (not whatsapp--transport-data))
-               (when (and (cdr (assoc "checking" whatsapp--transport-data)) (< whatsapp--transport-round 20))
-                 (cl-incf whatsapp--transport-round)
-                 (setq whatsapp--transport-timer
-                       (run-at-time 0.5 nil (lambda () (when (buffer-live-p buffer)
-                                                       (with-current-buffer buffer (whatsapp--transport-fetch)))))))))))))))
+    (let ((buffer (current-buffer)) (origin whatsapp--transport-origin)
+          (generation (cl-incf whatsapp--transport-generation)))
+      (setq whatsapp--transport-pending t)
+      (condition-case nil
+          (whatsapp--request-async
+           "GET" (if fresh "/transport/status?refresh=1" "/transport/status") nil
+           (lambda (result)
+             (when (buffer-live-p buffer)
+               (with-current-buffer buffer
+                 (when (whatsapp--transport-current-p origin generation)
+                   (setq whatsapp--transport-pending nil
+                         whatsapp--transport-data
+                         (and (whatsapp--ok-p (car-safe result))
+                              (proper-list-p (cdr-safe result)) (cdr-safe result)))
+                   (whatsapp-session-observe whatsapp--transport-data origin)
+                   (whatsapp--transport-render (not whatsapp--transport-data))
+                   (let* ((checking (eq t (cdr (assoc "checking" whatsapp--transport-data))))
+                          (state (cdr (assoc "session_state" whatsapp--transport-data)))
+                          (watch (and (> whatsapp--transport-watch-until (float-time))
+                                      (not (member state '("ready" "pairing-required" "authentication-required"))))))
+                     (when (and whatsapp--transport-data (or checking watch) (< whatsapp--transport-round 40))
+                       (cl-incf whatsapp--transport-round)
+                       (setq whatsapp--transport-timer
+                             (run-at-time
+                              (if checking 0.5 2) nil
+                              (lambda ()
+                                (when (buffer-live-p buffer)
+                                  (with-current-buffer buffer
+                                    (when (whatsapp--transport-current-p origin generation)
+                                      (whatsapp--transport-fetch (not checking)))))))))))))))
+        (error
+         (setq whatsapp--transport-pending nil)
+         (whatsapp--transport-render t))))))
+
 (defun whatsapp-connection-refresh ()
-  "Read transport state only; never repair implicitly."
+  "Request a fresh check (bridge rate-limits it); never reconnect implicitly."
   (interactive)
-  (setq whatsapp--transport-round 0)
-  (whatsapp--transport-fetch))
+  (when (timerp whatsapp--transport-timer) (cancel-timer whatsapp--transport-timer))
+  (setq whatsapp--transport-timer nil whatsapp--transport-round 0)
+  (whatsapp--transport-fetch t))
+
 (defun whatsapp-connection-panel ()
-  "Open a redacted transport diagnosis without sending messages or reconnecting."
+  "Open diagnosis using the currently loaded Emacs account, without a session write."
   (interactive)
   (let ((buffer (get-buffer-create "*WhatsApp connection*")))
     (pop-to-buffer buffer)
     (unless (eq major-mode 'special-mode) (special-mode))
     (unless (equal whatsapp--transport-origin (whatsapp--origin-key))
       (whatsapp--transport-stop)
-      (setq whatsapp--closing nil whatsapp--transport-data nil whatsapp--transport-pending nil))
+      (setq whatsapp--closing nil whatsapp--transport-data nil))
     (setq whatsapp--transport-origin (whatsapp--origin-key))
     (add-hook 'kill-buffer-hook #'whatsapp--transport-stop nil t)
     (whatsapp--transport-render)
     (whatsapp-connection-refresh)))
-(defun whatsapp-repair-incoming (&optional replace)
-  "Explicitly register this bridge callback, preserving verified subscriptions.
-With a prefix argument allow replacing a DIFFERENT callback after a second
-confirmation. Never disconnect, pair, or send a WhatsApp message."
+
+(defun whatsapp--transport-action (path payload)
+  "Submit one explicitly selected operation; stale callbacks cannot mutate a new panel."
+  (let ((buffer (current-buffer)) (origin whatsapp--transport-origin)
+        (generation (cl-incf whatsapp--transport-generation)))
+    (when (timerp whatsapp--transport-timer) (cancel-timer whatsapp--transport-timer))
+    (setq whatsapp--transport-timer nil whatsapp--transport-pending t)
+    (condition-case nil
+        (whatsapp--request-async
+         "POST" path payload
+         (lambda (result)
+           (when (buffer-live-p buffer)
+             (with-current-buffer buffer
+               (when (whatsapp--transport-current-p origin generation)
+                 (setq whatsapp--transport-pending nil)
+                 (if (and (eq (car-safe result) 202)
+                          (proper-list-p (cdr-safe result))
+                          (eq (cdr (assoc "accepted" (cdr result))) t))
+                     (progn
+                       (when (equal path "/transport/connect")
+                         (setq whatsapp--transport-watch-until (+ (float-time) 30)))
+                       (setq whatsapp--transport-round 0)
+                       (whatsapp--transport-fetch))
+                   (message "Operation not confirmed. Refresh check; no automatic retry was made.")))))))
+      (error
+       (setq whatsapp--transport-pending nil)
+       (message "Operation could not start. No automatic retry was made.")))))
+
+(defun whatsapp-connection-connect ()
+  "Connect after confirmation; preserve session and subscriptions, never log out."
+  (interactive)
+  (unless (equal whatsapp--transport-origin (whatsapp--origin-key))
+    (user-error "Reopen the connection panel for the current account"))
+  (when (or whatsapp--transport-pending (> whatsapp--transport-watch-until (float-time)))
+    (user-error "Wait for the current session operation; do not submit a second connect"))
+  (when (yes-or-no-p "Connect this backend account, retaining its session and subscriptions? A linking QR may be required: ")
+    (whatsapp--transport-action "/transport/connect" '((confirm . t)))))
+
+(defun whatsapp-repair-incoming (&optional replace profiles)
+  "Explicitly register this callback; preserve all subscriptions. Never connect or log out."
   (interactive "P")
   (unless (equal whatsapp--transport-origin (whatsapp--origin-key))
     (user-error "Reopen the connection panel for the current account"))
   (when whatsapp--transport-pending (user-error "Wait for the current check"))
-  (when (and (yes-or-no-p "Register this bridge for incoming messages, preserving existing event subscriptions? ")
-             (or (not replace) (yes-or-no-p "REPLACE a different existing callback? Its previous consumer can stop receiving events. ")))
-    (setq whatsapp--transport-pending t)
-    (let ((buffer (current-buffer)))
-      (whatsapp--request-async
-       "POST" "/transport/repair" `((confirm . t) (replace . ,(if replace t :json-false)))
-       (lambda (result)
-         (when (buffer-live-p buffer)
-           (with-current-buffer buffer
-             (setq whatsapp--transport-pending nil)
-             (if (eq (car result) 202)
-                 (progn (setq whatsapp--transport-round 0) (whatsapp--transport-fetch))
-               (message "Callback repair not confirmed. Refresh the check; no automatic retry was attempted.")))))))))
+  (when (and (yes-or-no-p (if profiles
+                            "Register Message/ReadReceipt/Presence/ChatPresence/Picture events, preserving existing subscriptions? "
+                          "Register this bridge for incoming messages, preserving existing subscriptions? "))
+             (or (not replace) (yes-or-no-p "REPLACE a different callback? Its previous consumer can stop receiving events: ")))
+    (whatsapp--transport-action
+     "/transport/repair"
+     (append `((confirm . t) (replace . ,(if replace t :json-false)))
+             (when profiles '((profiles . t)))))))
+
+(defun whatsapp-repair-profile-events (&optional replace)
+  "Register profile events after consent; no session connect or self-online announcement."
+  (interactive "P")
+  (whatsapp-repair-incoming replace t))
+
 (provide 'whatsapp-delivery)
 ;;; whatsapp-delivery.el ends here

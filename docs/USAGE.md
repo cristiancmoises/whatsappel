@@ -1,9 +1,54 @@
-# WhatsAppel 3.1 user guide
+# WhatsAppel 3.3 — user guide
 
 Open `M-x whatsapp`. The dashboard provides New chat, Search, Refresh and Commands.
-Use the All, Unread and Groups filters, click a contact, or press Enter on its row.
+Use Inbox, Unread, Pinned, Direct, Groups and Archived filters. Click a contact,
+or press Enter on its row.
 Tab visits buttons. `/` searches names, numbers and message previews; `?` opens the
 command menu. You can still open a conversation with `M-x whatsapp-open-chat`.
+
+`a` archives or restores the conversation on WhatsApp after provider confirmation.
+`P` pins it locally above other conversations. `m` or right-click opens chat tools;
+`C-c C-t` opens them inside a conversation. `i` opens contact details and the photo.
+Archived contains changes confirmed through this client; archive changes made on
+another device are not imported. Pins and archive choices persist per account in
+`whatsapp-tools-state-directory`; this stores contact identities and flags only.
+
+Photos need graphical Emacs with PNG support and FFmpeg for bounded thumbnails.
+Privacy restrictions and removed photos keep the initials fallback. Use Contact
+details → Retry photo or Commands → Profile diagnostics when a photo is missing.
+
+## Configuration and aliases
+
+The Lisp package is `whatsapp`, even when the repository directory has another name:
+
+```elisp
+(add-to-list 'load-path (expand-file-name "~/.emacs.d/local-repo/whatsapp"))
+(require 'whatsapp)
+```
+
+Run `M-x whatsapp` or, from 3.3 onward, `M-x whatsappel`. On older versions add
+`(defalias 'whatsappel #'whatsapp)` after `require`. A Git pull updates the files;
+restart Emacs to load the new code.
+
+For a terminal alias in Fish, using the source path from the configuration above:
+
+```fish
+alias whatsappel 'python3 ~/.emacs.d/local-repo/whatsapp/scripts/launch-whatsappel.py'
+funcsave whatsappel
+```
+
+For Bash, put the following in `~/.bashrc`:
+
+```sh
+alias whatsappel='python3 ~/.emacs.d/local-repo/whatsapp/scripts/launch-whatsappel.py'
+```
+
+The launcher reads the protected `.env` beside that source, or an explicitly
+selected complete environment account. Configure the bridge before launching.
+After the local bundle installer creates `~/.local/bin/whatsappel`, the command
+already exists; ensure that directory is in PATH.
+On Guix, the launcher uses the selected Emacs profile's image-loader cache to
+avoid mixing incompatible SVG loaders from Home and system profiles.
 
 Inside a conversation, type after the prompt. Enter sends; `C-j` adds a newline.
 The visible Send and Attach buttons perform the same actions. Drafts, pending
@@ -66,3 +111,18 @@ and test a private conversation with a willing contact: text, reply, one photo,
 one original document, download/save and reconnect. Compare original and saved
 file hashes for an original-file transfer. The offline audit cannot verify your
 WhatsApp account, external media CDN retention, or optional wuzapi retry patch.
+
+## Connection and photo recovery
+
+Use Commands → Connection status to distinguish cached history from fresh backend
+readiness. The connection panel offers Connect existing session when explicitly
+requested and a linking QR when login is needed. Neither an accepted connection
+request nor provider acceptance of a message establishes delivery. After observed
+session recovery, profile retries become eligible again. Profile diagnostics
+explain missing routes, privacy restrictions, decoder failures and deadlines.
+Use Retry photo for the selected contact; do not repeatedly relink a working account.
+
+Install a `.zupt` release using the commands in the README. The guarded installer
+checks source hashes and runs two full audits before updating managed files. It
+preserves private configuration and creates a rollback backup. Restart Emacs
+afterward. `--restart-local` restarts only a verified local Shepherd bridge.

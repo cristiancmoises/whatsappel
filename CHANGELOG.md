@@ -1,12 +1,78 @@
 # Changelog
 
-## 3.2.0-rc17 — README / documentation refresh
+## 3.3.0 — contact photos and conversation organization
 
-- Reworked English and PT-BR README files around the current native Emacs workflow.
-- Added all five user-supplied application screenshots to the public documentation.
-- Preserved three screenshots byte-for-byte; cropped only the bottom modeline/footer from two conversation screenshots as explicitly requested.
-- Added screenshot provenance notes and four-forge publication tooling.
-- Application behavior remains RC17; this documentation refresh does not claim new delivery, profile, presence, Pale, or security behavior.
+- Render and schedule contact photos for any visible graphical Emacs frame,
+  including mixed terminal/daemon sessions; retain initials as terminal fallback.
+- Add authenticated archive/unarchive routing to wuzapi with strict JID and
+  boolean validation. Update the local view only after explicit provider success;
+  reject duplicate pending requests and ignore callbacks after an account switch.
+- Add Inbox, Archived and Pinned filters, persistent local pins, row actions on
+  `m`/right-click, contact identity copying, profile diagnostics and an Emacs alias.
+- Store bounded account-scoped organization preferences as private atomic JSON;
+  refuse symbolic links and keep credentials, media and messages out of this store.
+- Retain installed RC18–20 session, profile, receipt and bounded-worker fixes.
+- Select the matching Guix Emacs image-loader cache inside the launcher; accept
+  stable version labels in the guarded installer as well as release candidates.
+- Distribute the complete source/update bundle as `.zupt` with SHA-256 checksums.
+  Native fixtures validate behavior; no live recipient sends are part of testing.
+
+
+## 3.2.0-rc20 — receipt, cache and deadline reliability
+
+- Preserve higher observed delivered/read state for the same own-message record
+  while merging history; retain metadata enrichment and ownership boundaries.
+- Keep still-valid profile pictures for explicit transient failures only; do not
+  renew their TTL. Expire avatar/full-photo variants independently. Removal,
+  denial, changed revision and account reset retain their invalidation behavior.
+- Add a typed overall-deadline exception compatible with existing error handlers;
+  read, download and profile workers return bounded timeout categories.
+- Prevent a pending readiness check from displaying its retained ready state as a
+  new observation or triggering profile-session recovery.
+- Require consistent fresh ready state before the diagnostic's optional media
+  sample. Select the environment/file account source before opening local .env.
+- Add 13 executable Python regressions, 15 native ERT cases and nine Guile
+  assertions. Required native audits remain mandatory; live acceptance is separate.
+- Retain the complete personal init unchanged and outside public application source.
+  No reconnect, callback mutation, message send, new PALE adapter or stable-release
+  promotion is performed by this update.
+
+## 3.2.0-rc19 — session recovery and media-error preservation
+
+- Separate cached conversation history from fresh backend connection/login state.
+- Add an authenticated, explicitly confirmed, asynchronous session-connect action.
+  Inspect state first, preserve known subscriptions, issue at most one provider
+  connect request, and verify readiness independently. No logout, session deletion,
+  callback replacement, self-presence announcement, or message replay.
+- Fetch the linking QR asynchronously in graphical Emacs without writing it to disk.
+- Make Refresh check request a fresh, rate-limited backend check. Isolate late
+  callbacks by account and panel generation and release pending state on errors.
+- Preserve only numeric provider errors and constant categories when a media-job
+  read fails; do not relay private provider bodies or signed media URLs.
+- Catch refused redirects in the send worker, preserving its no-redirect/no-retry
+  policy and emitting a bounded result instead of a traceback.
+- Release profile retry backoff after observed session recovery without granting
+  presence consent, clearing valid cached photos, or guessing recipient identities.
+- Add a read-only session doctor that gates the optional media probe on fresh
+  connected/logged-in evidence. A skipped sample is not a download failure.
+- Retain all RC18 media/profile repairs and guarded double native audit gates.
+- Tests use local synthetic providers. Live login, recipient delivery, permitted
+  profile photos and GUI rendering require separate user acceptance.
+
+
+## 3.2.0-rc18 — photos, media and profile events
+
+- Route download submission through an owned bounded Python worker, preserving
+  successful provider envelopes and typed HTTP errors without automatic retries.
+- Use the configured authoritative LID map for profile queries/event matching;
+  never guess a phone or rewrite a message recipient.
+- Validate PNG/JPEG with generic HTTP media types; keep CDN/TLS/DNS restrictions.
+- Distinguish bridge authentication, route and busy failures; shorten busy cache.
+- Expose individual profile-event subscriptions and add a separately confirmed
+  registration action that preserves existing subscriptions and callback ownership.
+- Retain last-seen history separately from fresh presence; no remote Idle inference.
+- Add Python, Emacs and Guile regressions and preserve mandatory double full audits.
+- No PALE adapter, self-online announcement, account reset or live delivery claim.
 
 # 3.2.0-rc17 — focused send-failure guard
 
@@ -199,7 +265,6 @@ All notable changes to WhatsApp.el are documented here. This project adheres to
 - Hash-anchored candidate-audited updates, rollback journals and strict-host-key IONOS deployment.
 - Isolated publication worktree, curated commit paths and four-forge hidden-token publication.
 - Native ERT regressions plus Python, loopback HTTP, media-fixture, archive and Git isolation tests.
-- English and Brazilian Portuguese guides, release-audit limitations and implementation prompt.
 
 ### Fixed
 - Synchronous interactive sending, whole-history rendering for every image completion,
@@ -323,7 +388,6 @@ anywhere. The backend is now **Guile Scheme** (`whatsappel.scm`) talking to
   Signal double-ratchet + protobufs) is delegated to wuzapi rather than reimplemented.
 - **Client rewritten** as a lean, telega-style `whatsapp.el` (`whatsapp-bridge-url`
   / `whatsapp-bridge-token`): root chat-list buffer, per-chat message buffers with
-  a bottom input prompt, inline images/stickers, external player for audio/video/GIF.
 - **Removed** `server.js`, `package.json`, `package-lock.json`, the Node test
   suite, the Baileys bridge docs, the Docker/compose files and the OpenAPI spec —
   none apply to the Guile backend.

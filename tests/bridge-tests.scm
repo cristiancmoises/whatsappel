@@ -160,6 +160,96 @@
   (set-cdr! (assoc "data_json" row) "")
   (test-assert "other sender without metadata is not inferred own" (not (jget (history-row->rec row) "me"))))
 
+
+;; RC18: metadata aliases are authoritative and never change send identities.
+(let ((saved-map *lidmap*) (saved-profiles *profile-store*)
+      (saved-request wuzapi-request) (calls '()) (events '("Message" "CustomEvent")))
+  (dynamic-wind
+    (lambda () (set! *lidmap* (make-hash-table)) (set! *profile-store* (make-hash-table)))
+    (lambda ()
+      (test-equal "unmapped LID is preserved, not guessed" "123456789@lid"
+        (profile-provider-jid "123456789@lid"))
+      (hash-set! *lidmap* "123456789" "987654321@s.whatsapp.net")
+      (test-equal "authoritative map is used for metadata" "987654321"
+        (profile-provider-jid "123456789@lid"))
+      (test-equal "group identity remains a group" "123456-789@g.us"
+        (profile-provider-jid "123456-789@g.us"))
+      (hash-set! *lidmap* "777777777" "hostile@other")
+      (test-equal "invalid authoritative entry cannot redirect metadata" "777777777@lid"
+        (profile-provider-jid "777777777@lid"))
+      (profile-record! "123456789@lid")
+      (profile-record! "222222222@lid")
+      (profile-event! '(("type" . "Presence") ("event" ("From" . "987654321@s.whatsapp.net") ("Unavailable" . #f))))
+      (test-equal "phone event reaches requested matching LID" "online"
+        (assoc-ref (hash-ref *profile-store* "123456789@lid") "availability"))
+      (test-equal "phone event never reaches unrelated LID" "unknown"
+        (assoc-ref (hash-ref *profile-store* "222222222@lid") "availability"))
+      (profile-event! '(("type" . "Picture") ("event" ("JID" . "987654321@s.whatsapp.net"))))
+      (test-equal "picture revision reaches authoritative alias" 1
+        (assoc-ref (hash-ref *profile-store* "123456789@lid") "photo_revision"))
+      (let* ((rec (hash-ref *profile-store* "123456789@lid")) (seen (- (current-time) 120)))
+        (profile-set! rec "availability" "offline")
+        (profile-set! rec "availability_at" -1000000)
+        (profile-set! rec "last_seen" seen)
+        (let ((snapshot (profile-snapshot "123456789@lid" rec)))
+          (test-equal "expired offline becomes unknown" "unknown" (assoc-ref snapshot "availability"))
+          (test-assert "no fresh last_seen claim after expiry" (not (assoc "last_seen" snapshot)))
+          (test-equal "separate historical observation survives" seen (assoc-ref snapshot "last_seen_observed"))))
+      (set! wuzapi-request
+        (lambda (method path payload)
+          (set! calls (cons (list method path payload) calls))
+          (cond
+           ((equal? path "/user/avatar")
+            (values 200 '(("success" . #t) ("data" ("URL" . "https://pps.whatsapp.net/synthetic"))) "{}"))
+           ((and (eq? method 'POST) (equal? path "/webhook"))
+            (set! events (vector->list (assoc-ref payload "events")))
+            (values 200 '(("success" . #t)) "{}"))
+           ((equal? path "/webhook")
+            (values 200 (list (cons "success" #t)
+                         (cons "data" (list (cons "webhook" *hook-url*) (cons "subscribe" (list->vector events))))) "{}"))
+           (else (error "Unexpected provider call in regression")))))
+      (profile-upstream "avatar" "123456789@lid")
+      (test-equal "avatar request uses provider phone from mapping" "987654321"
+        (assoc-ref (caddar calls) "Phone"))
+      (set! calls '())
+      (transport-repair #f)
+      (test-assert "ordinary callback repair does not opt into presence" (not (member "Presence" events)))
+      (transport-repair #f #t)
+      (test-assert "explicit profile repair retains existing subscription" (member "CustomEvent" events))
+      (test-assert "explicit profile repair adds all three profile events"
+        (every (lambda (name) (member name events)) '("Presence" "ChatPresence" "Picture")))
+      (test-assert "repair never announces self presence or reconnects"
+        (every (lambda (call) (equal? (cadr call) "/webhook")) calls))
+      (test-equal "unknown profile subscription stays unknown" "unknown" (transport-subscribed #f "Presence"))
+      (test-equal "all-events wildcard reports profile subscription" "yes"
+        (transport-subscribed (list "fixture" '("All")) "Picture")))
+    (lambda () (set! *lidmap* saved-map) (set! *profile-store* saved-profiles)
+      (set! wuzapi-request saved-request))))
+
+;; RC20: existing receipts remain authoritative during an own-history refresh.
+(let* ((chat "123456789@lid")
+       (own (lambda (state) (rec "fixture-rc20" chat "123" (cons "me" #t)
+                                (cons "text" "synthetic") (cons "delivery" state))))
+       (merge-state (lambda (a b)
+                      (jget (car (merge-records (list (own a)) (list (own b)))) "delivery"))))
+  (test-equal "history acceptance cannot downgrade delivered" "delivered" (merge-state "delivered" "accepted"))
+  (test-equal "history acceptance cannot downgrade read" "read" (merge-state "read" "accepted"))
+  (test-equal "late delivered cannot downgrade read" "read" (merge-state "read" "delivered"))
+  (test-equal "a new read receipt can advance accepted" "read" (merge-state "accepted" "read"))
+  (let* ((enriched (rec "fixture-rc20" chat "124" (cons "me" #t) (cons "delivery" "accepted")
+                        (cons "caption" "synthetic caption")))
+         (merged (car (merge-records (list (own "read")) (list enriched)))))
+    (test-equal "refresh still enriches caption" "synthetic caption" (jget merged "caption"))
+    (test-equal "refresh keeps one canonical delivery field" 1
+      (length (filter (lambda (p) (equal? (car p) "delivery")) merged)))
+    (test-equal "refresh keeps the existing read receipt" "read" (jget merged "delivery")))
+  (let ((incoming (rec "fixture-rc20" chat "124" (cons "me" #f) (cons "delivery" "accepted"))))
+    (test-equal "ownership conflict does not inherit own receipt" "accepted"
+      (jget (car (merge-records (list (own "read")) (list incoming))) "delivery")))
+  (test-equal "different IDs stay distinct" 2
+    (length (merge-records (list (own "read"))
+      (list (rec "fixture-other" chat "125" (cons "me" #t) (cons "delivery" "accepted")))))))
+
 (let ((failures (test-runner-fail-count (test-runner-current))))
   (test-end "bridge")
   (exit (if (zero? failures) 0 1)))

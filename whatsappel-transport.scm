@@ -162,25 +162,80 @@
 (define (transport-label value)
   (cond ((eq? value #t) "yes") ((eq? value #f) "no") (else "unknown")))
 
+(define (transport-subscribed hook name)
+  (transport-label (if hook (if (or (member "All" (cadr hook)) (member name (cadr hook))) #t #f) 'null)))
+
+(define (transport-session-state status session)
+  "Describe session evidence; missing or inconsistent booleans stay unknown."
+  (let ((connected (transport-bool session "Connected"))
+        (logged (transport-bool session "LoggedIn")))
+    (cond ((member status '(401 403)) "authentication-required")
+          ((not (<= 200 status 299)) "provider-unavailable")
+          ((or (eq? connected 'null) (eq? logged 'null)) "unknown")
+          ((not connected) "disconnected")
+          ((not logged) "pairing-required")
+          (else "ready"))))
+
+(define (transport-connect)
+  "One explicit session-connect attempt, never logout, callback repair or resend."
+  (call-with-values (lambda () (wuzapi-request 'GET "/session/status" #f))
+    (lambda (status parsed raw)
+      (let* ((session (and (upstream-ok? status parsed) (json-unique-tree? parsed)
+                           (jget parsed "data")))
+             (state (transport-session-state status session)))
+        (cond
+         ((equal? state "ready") '(("connect_result" . "already-connected")))
+         ((equal? state "pairing-required") '(("connect_result" . "pairing-required")))
+         ((not (equal? state "disconnected"))
+          (list (cons "connect_result" "status-unverified-no-connect")))
+         (else
+          (call-with-values (lambda () (wuzapi-request 'GET "/webhook" #f))
+            (lambda (ws wp wr)
+              (let* ((config (and (upstream-ok? ws wp) (json-unique-tree? wp) (webhook-config wp)))
+                     (configured (filter (lambda (x) (not (string-null? x)))
+                                         (map string-trim-both (string-split *subscribe* #\,)))))
+                (if (or (not config) (> (length configured) 64)
+                        (not (every (lambda (name)
+                                      (and (<= (string-length name) 80)
+                                           (string-match "^[A-Za-z][A-Za-z0-9]*$" name))) configured)))
+                    '(("connect_result" . "subscriptions-unverified-no-connect"))
+                    (let ((events (delete-duplicates (append (cadr config) configured '("Message" "ReadReceipt")))))
+                      (if (> (length events) 64)
+                          '(("connect_result" . "subscriptions-unverified-no-connect"))
+                          (call-with-values
+                              (lambda () (wuzapi-request 'POST "/session/connect"
+                                          (list (cons "Subscribe" (list->vector events))
+                                                (cons "Immediate" #t))))
+                            (lambda (cs cp cr)
+                              (list (cons "connect_http" cs)
+                                    (cons "connect_result"
+                                      (cond ((upstream-ok? cs cp) "requested-check-status")
+                                            ((= cs 409) "already-started-check-status")
+                                            (else "unconfirmed-no-automatic-retry"))))))))))))))))))
+
 (define (transport-inspect)
   (call-with-values (lambda () (wuzapi-request 'GET "/session/status" #f))
     (lambda (ss sp sr)
       (call-with-values (lambda () (wuzapi-request 'GET "/webhook" #f))
         (lambda (ws wp wr)
-          (let* ((session (and (upstream-ok? ss sp) (jget sp "data")))
-                 (hook (and (upstream-ok? ws wp) (webhook-config wp))))
-            (list (cons "checked" #t) (cons "status_http" ss) (cons "webhook_http" ws)
+          (let* ((session (and (upstream-ok? ss sp) (json-unique-tree? sp) (jget sp "data")))
+                 (hook (and (upstream-ok? ws wp) (json-unique-tree? wp) (webhook-config wp))))
+            (list (cons "session_state" (transport-session-state ss session))
+                  (cons "checked" #t) (cons "status_http" ss) (cons "webhook_http" ws)
                   (cons "connection_state" (transport-label (transport-bool session "Connected")))
                   (cons "login_state" (transport-label (transport-bool session "LoggedIn")))
                   (cons "callback_state" (transport-label (if hook (equal? (car hook) *hook-url*) 'null)))
                   (cons "subscription_state" (transport-label (if hook (if (or (member "All" (cadr hook)) (member "Message" (cadr hook))) #t #f) 'null)))
+                  (cons "presence_subscription_state" (transport-subscribed hook "Presence"))
+                  (cons "activity_subscription_state" (transport-subscribed hook "ChatPresence"))
+                  (cons "picture_subscription_state" (transport-subscribed hook "Picture"))
                   (cons "connected" (transport-bool session "Connected"))
                   (cons "logged_in" (transport-bool session "LoggedIn"))
                   (cons "webhook_matches" (if hook (equal? (car hook) *hook-url*) 'null))
                   (cons "message_subscribed" (if hook (if (or (member "All" (cadr hook))
                                                                            (member "Message" (cadr hook))) #t #f) 'null)))))))))
 
-(define (transport-repair replace?)
+(define* (transport-repair replace? #:optional (profiles? #f))
   ;; Explicit operator action. Preserve all subscriptions, never connect/logout.
   ;; wuzapi has no CAS; read again and verify, but no claim of external-writer safety.
   (call-with-values (lambda () (wuzapi-request 'GET "/webhook" #f))
@@ -192,7 +247,8 @@
                (not (equal? (car config) *hook-url*)))
           '(("repair" . "different-callback-confirmation-required")))
          (else
-          (let ((events (delete-duplicates (append (cadr config) '("Message" "ReadReceipt")))))
+          (let ((events (delete-duplicates (append (cadr config) '("Message" "ReadReceipt")
+                                (if profiles? '("Presence" "ChatPresence" "Picture") '())))))
             (call-with-values
                 (lambda () (wuzapi-request 'POST "/webhook"
                             (list (cons "webhookurl" *hook-url*)
@@ -209,7 +265,7 @@
                                      "registered-not-reachability-tested" "verification-failed")))))))))))))))
 )
 
-(define (transport-start! operation replace?)
+(define* (transport-start! operation replace? #:optional (profiles? #f))
   (let ((started (with-mutex *transport-mutex*
                    (and (not *transport-busy*)
                         (begin (set! *transport-busy* #t) #t)))))
@@ -222,7 +278,9 @@
                     (catch #t
                       (lambda ()
                         (parameterize ((wuzapi-response-limit 65536))
-                          (let ((repair (if (eq? operation 'repair) (transport-repair replace?) '())))
+                          (let ((repair (cond ((eq? operation 'repair) (transport-repair replace? profiles?))
+                                              ((eq? operation 'connect) (transport-connect))
+                                              (else '()))))
                             (append repair (transport-inspect)))))
                       (lambda _ '(("checked" . #f) ("error" . "transport-check-failed"))))))
                (with-mutex *transport-mutex*
@@ -232,13 +290,14 @@
         (lambda _ (with-mutex *transport-mutex* (set! *transport-busy* #f)))))
     started))
 
-(define (handle-transport-status)
+(define* (handle-transport-status #:optional (refresh? #f))
   (when (with-mutex *transport-mutex*
-          (and (not *transport-busy*) (>= (- (current-time) *transport-last-check*) 15)))
+          (and (not *transport-busy*)
+               (>= (- (current-time) *transport-last-check*) (if refresh? 2 15))))
     (transport-start! 'check #f))
   (json-response 200
     (with-mutex *transport-mutex*
-      (append (list (cons "version" "3.2.0-rc17") (cons "checking" *transport-busy*)
+      (append (list (cons "version" "3.3.0") (cons "checking" *transport-busy*)
                     (cons "checked_age" (if (> *transport-last-check* 0) (- (current-time) *transport-last-check*) 'null))
                     (cons "webhooks_seen" *transport-event-count*)
                     (cons "messages_ingested" *transport-message-count*)
@@ -246,12 +305,25 @@
               *transport-state*))))
 
 (define (handle-transport-repair raw)
-  (let* ((o (safe-json-parse raw)) (replace? (and o (assoc-ref o "replace"))))
+  (let* ((o (safe-json-parse raw)) (replace? (and o (assoc-ref o "replace")))
+         (profiles? (and o (assoc-ref o "profiles"))))
     (cond
-     ((or (not o) (not (every (lambda (p) (member (car p) '("confirm" "replace"))) o))
+     ((or (not o) (not (every (lambda (p) (member (car p) '("confirm" "replace" "profiles"))) o))
           (not (eq? #t (assoc-ref o "confirm")))
-          (and (assoc "replace" o) (not (boolean? replace?))))
+          (and (assoc "replace" o) (not (boolean? replace?)))
+          (and (assoc "profiles" o) (not (boolean? profiles?))))
       (json-response 400 '(("error" . "Explicit callback repair confirmation required"))))
-     ((transport-start! 'repair replace?)
+     ((transport-start! 'repair replace? profiles?)
       (json-response 202 '(("accepted" . #t) ("note" . "Poll transport status; no message sent"))))
      (else (json-response 429 '(("error" . "Transport check busy; retry explicitly")))))))
+
+(define (handle-transport-connect raw)
+  (let ((o (safe-json-parse raw)))
+    (cond
+     ((or (not o) (not (json-unique-tree? o))
+          (not (equal? (map car o) '("confirm")))
+          (not (eq? #t (assoc-ref o "confirm"))))
+      (json-response 400 '(("error" . "Explicit session-connect confirmation required"))))
+     ((transport-start! 'connect #f)
+      (json-response 202 '(("accepted" . #t) ("note" . "Poll status; connection is not yet verified"))))
+     (else (json-response 429 '(("error" . "Transport operation busy; no connect was started")))))))

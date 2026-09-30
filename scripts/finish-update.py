@@ -357,7 +357,7 @@ def main(argv=None):
         if not args.check and os.getuid() == 0:
             raise FinishError('Run the workstation update without sudo/root.')
         spec = update.verify_bundle(bundle)
-        if not re.fullmatch(r'\d+\.\d+\.\d+-rc\d+', spec['version']):
+        if not re.fullmatch(r'\d+\.\d+\.\d+(?:-rc\d+)?', spec['version']):
             raise FinishError('Invalid package version.')
         report['expected_version'] = spec['version']
         if destination:

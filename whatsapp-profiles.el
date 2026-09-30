@@ -118,6 +118,23 @@ The background still identifies the selected row. Other Emacs buffers are unchan
              "Offline · last seen unavailable"))
           (t "Status unavailable"))))
 
+(defun whatsapp-profiles--presence-context (jid)
+  "Explain missing presence using local consent/state, not inferred remote activity."
+  (let* ((rec (gethash (whatsapp-profiles--key jid) whatsapp-profiles--meta))
+         (seen (plist-get rec :last-seen-observed)))
+    (cond ((not (whatsapp-profiles--current-p)) "Account changed; reopen this contact")
+          ((string-suffix-p "@g.us" jid) "Groups have no single online/offline state")
+          ((and (numberp seen) (> seen 0))
+           (concat "Previous last-seen observation: "
+                   (format-time-string "%d %b %H:%M" (seconds-to-time seen))
+                   "; this does not establish current presence"))
+          ((not (and whatsapp-profile-presence-enabled
+                     (equal whatsapp-profiles--consent-origin (whatsapp--origin-key))))
+           "Not enabled for this account; use Privacy / presence")
+          ((equal (plist-get rec :subscription) "Subscription unavailable")
+           "Contact subscription failed; check provider support and connection")
+          (t "Requires incoming Presence/ChatPresence events and provider/privacy support"))))
+
 (defun whatsapp-profiles--photo (jid &optional large)
   "Return an already prepared image; never decode on a rendering path."
   (let* ((key (cons (whatsapp-profiles--key jid) (if large 'photo 'avatar)))
@@ -127,7 +144,7 @@ The background still identifies the selected row. Other Emacs buffers are unchan
 
 ;; Replacing text with an image spec retains the underlying text for terminal use.
 (defun whatsapp-profiles--display (jid &optional large)
-  (or (and (display-graphic-p)
+  (or (and (whatsapp-profiles--graphical-p)
            (let ((image (whatsapp-profiles--photo jid (and large (not (eq large 'header))))))
              (if (and image (eq large 'header))
                  (let ((copy (copy-tree image)))
@@ -182,8 +199,9 @@ The background still identifies the selected row. Other Emacs buffers are unchan
             (set-buffer-modified-p modified))
           (whatsapp-profiles--update-header))))))
 
-(defun whatsapp-profiles--drop-photo (jid)
-  (dolist (kind '(avatar photo))
+(defun whatsapp-profiles--drop-photo (jid &optional action)
+  "Invalidate JID, or only ACTION when one cached image size expires."
+  (dolist (kind (if action (list action) '(avatar photo)))
     (let ((key (cons jid kind)))
       (remhash key whatsapp-profiles--photos)
       (setq whatsapp-profiles--photo-order (delete key whatsapp-profiles--photo-order))))
@@ -232,6 +250,16 @@ The background still identifies the selected row. Other Emacs buffers are unchan
   (clrhash whatsapp-profiles--meta)
   (clrhash whatsapp-profiles--photos)
   (whatsapp-profiles--paint-avatars nil))
+
+(defun whatsapp-profiles-session-recovered ()
+  "Release retry backoff after observed login; preserve images and presence consent."
+  (when (equal whatsapp-profiles--scope (whatsapp--origin-key))
+    (setq whatsapp-profiles--next-capability 0 whatsapp-profiles--next-snapshot 0)
+    (maphash (lambda (jid rec)
+               (setq rec (plist-put rec :photo-next 0)
+                     rec (plist-put rec :subscribe-next 0))
+               (puthash jid rec whatsapp-profiles--meta))
+             whatsapp-profiles--meta)))
 
 (defun whatsapp-clear-profile-cache ()
   "Clear in-memory profile data and invalidate pending results.  No secure-erasure claim."
@@ -285,11 +313,13 @@ A nonzero exit can never publish a ready photo or upstream private values."
          (result (and (eq state 'exit)
                       (condition-case nil (whatsapp--json-read text) (error nil)))))
     (if (and (eq state 'exit) (equal exit-code 0))
-        (or result fallback)
-      (let* ((body (cdr (assoc "body" result))) (reason (cdr (assoc "reason" body))))
-        (if (and (equal (cdr (assoc "state" body)) "unavailable")
+        (if (and (proper-list-p result) (assoc "body" result)
+                 (proper-list-p (cdr (assoc "body" result)))) result fallback)
+      (let* ((body (and (proper-list-p result) (cdr (assoc "body" result))))
+             (reason (and (proper-list-p body) (cdr (assoc "reason" body)))))
+        (if (and (proper-list-p body) (equal (cdr (assoc "state" body)) "unavailable")
                  (member reason '("cdn-policy" "cdn-network" "image-rejected"
-                                  "decoder-unavailable" "decoder-failed" "worker-failed")))
+                                  "decoder-unavailable" "decoder-failed" "worker-failed" "worker-timeout")))
             (list '("status") (cons "body" (list '("state" . "unavailable")
                                                    (cons "reason" reason))))
           fallback)))))
@@ -354,6 +384,16 @@ A nonzero exit can never publish a ready photo or upstream private values."
       (remhash old whatsapp-profiles--meta)
       (whatsapp-profiles--drop-photo old))))
 
+(defun whatsapp-profiles--transient-photo-failure-p (body)
+  "Recognize transient failures only; this does not extend cached-photo lifetime."
+  (and (proper-list-p body) (equal (cdr (assoc "state" body)) "unavailable")
+       (let ((reason (cdr (assoc "reason" body)))
+             (status (cdr (assoc "provider_http" body))))
+         (or (member reason '("bridge-busy" "bridge-network" "cdn-network"
+                               "worker-timeout" "worker-failed"))
+             (and (equal reason "provider-rejected") (integerp status)
+                  (or (= status 429) (<= 500 status 599)))))))
+
 (defun whatsapp-profiles--accept (task result)
   "Apply one bounded, already validated worker response to memory-only state."
   (let* ((action (car task)) (key (cadr task)) (now (float-time))
@@ -388,6 +428,7 @@ A nonzero exit can never publish a ready photo or upstream private values."
                     rec (plist-put rec :availability (cdr (assoc "availability" item)))
                     rec (plist-put rec :activity (cdr (assoc "activity" item)))
                     rec (plist-put rec :last-seen (cdr (assoc "last_seen" item)))
+                    rec (plist-put rec :last-seen-observed (cdr (assoc "last_seen_observed" item)))
                     rec (plist-put rec :available-until (+ now (max 0 (- 60 (or age 60)))))
                     rec (plist-put rec :activity-until (+ now (max 0 (- 8 (or activity-age 8)))))
                     rec (plist-put rec :touched now))
@@ -405,13 +446,15 @@ A nonzero exit can never publish a ready photo or upstream private values."
       (let ((rec (gethash key whatsapp-profiles--meta)))
         (unless result
           (setq body '(("state" . "unavailable") ("reason" . "worker-failed"))))
-        (setq rec (plist-put rec :photo-next (+ now 120))
+        (setq rec (plist-put rec :photo-next
+                                  (+ now (if (equal (cdr (assoc "reason" body)) "bridge-busy") 3 120)))
               rec (plist-put rec :photo-result (cdr (assoc "state" body)))
               rec (plist-put rec :photo-reason
                              (let ((reason (cdr (assoc "reason" body))))
-                               (and (member reason '("provider-route" "provider-rejected" "cdn-policy"
+                               (and (member reason '("bridge-auth" "bridge-route" "bridge-busy" "bridge-network"
+                                                      "provider-route" "provider-rejected" "cdn-policy"
                                                       "cdn-network" "image-rejected" "decoder-unavailable"
-                                                      "decoder-failed" "worker-failed")) reason))))
+                                                      "decoder-failed" "worker-failed" "worker-timeout")) reason))))
         (puthash key rec whatsapp-profiles--meta))
       (cond
        ((and (equal status 200) (equal (cdr (assoc "state" body)) "ready"))
@@ -425,7 +468,8 @@ A nonzero exit can never publish a ready photo or upstream private values."
                  (error (let ((rec (gethash key whatsapp-profiles--meta)))
                           (puthash key (plist-put rec :decode-failed t) whatsapp-profiles--meta)))))))))
        ((member (cdr (assoc "state" body)) '("unavailable" "unsupported" "stale"))
-        (whatsapp-profiles--drop-photo key)))
+        (unless (whatsapp-profiles--transient-photo-failure-p body)
+          (whatsapp-profiles--drop-photo key))))
       (whatsapp-profiles--paint-status))
      ((eq action 'about)
       (let* ((rec (gethash key whatsapp-profiles--meta))
@@ -440,6 +484,12 @@ A nonzero exit can never publish a ready photo or upstream private values."
                         "Subscription requested" "Subscription unavailable")))
         (puthash key (plist-put rec :subscription label) whatsapp-profiles--meta))))))
 
+(defun whatsapp-profiles--graphical-p ()
+  "Whether any visible frame can display photos, including daemon clients."
+  (cl-some (lambda (frame)
+             (and (eq (frame-visible-p frame) t) (display-graphic-p frame)))
+           (frame-list)))
+
 (defun whatsapp-profiles--tick ()
   "Coalesced visible-only enrichment, lower priority than chat reads and sends."
   (condition-case nil
@@ -449,9 +499,9 @@ A nonzero exit can never publish a ready photo or upstream private values."
         (let ((visible (whatsapp-profiles--visible)) (now (float-time)))
           ;; A removal, account reset, or expiry must remove already displayed pixels.
           (let (expired)
-            (maphash (lambda (key entry) (when (<= (plist-get entry :expires) now) (push (car key) expired)))
+            (maphash (lambda (key entry) (when (<= (plist-get entry :expires) now) (push key expired)))
                      whatsapp-profiles--photos)
-            (dolist (key (delete-dups expired)) (whatsapp-profiles--drop-photo key)))
+            (dolist (key expired) (whatsapp-profiles--drop-photo (car key) (cdr key))))
           (whatsapp-profiles--paint-status)
           (when (and visible (stringp whatsapp-bridge-token) (not (whatsapp-profiles--user-work-p)))
             (cond
@@ -471,7 +521,7 @@ A nonzero exit can never publish a ready photo or upstream private values."
                   (when (> now (or (plist-get rec :subscribe-next) 0))
                     (puthash jid (plist-put rec :subscribe-next (+ now 300)) whatsapp-profiles--meta)
                     (whatsapp-profiles--enqueue 'subscribe jid))))
-              (when (and whatsapp-profile-photos (display-graphic-p))
+              (when (and whatsapp-profile-photos (whatsapp-profiles--graphical-p))
                 (dolist (jid visible)
                   (let ((rec (gethash jid whatsapp-profiles--meta)))
                     (when (and rec (not (member (plist-get rec :photo-state) '("removed" "unavailable")))
@@ -518,11 +568,13 @@ A nonzero exit can never publish a ready photo or upstream private values."
         (when (and whatsapp-profiles--detail-jid (equal whatsapp-profiles--detail-origin (whatsapp--origin-key)))
           (let ((inhibit-read-only t) (buffer-undo-list t))
             (with-silent-modifications
-              (dolist (field '(whatsapp-profile-status whatsapp-profile-about whatsapp-profile-photo-status))
+              (dolist (field '(whatsapp-profile-status whatsapp-profile-context whatsapp-profile-about whatsapp-profile-photo-status))
                 (when-let ((p (text-property-any (point-min) (point-max) field t)))
                   (put-text-property p (next-single-property-change p field nil (point-max)) 'display
                                      (cond ((eq field 'whatsapp-profile-status)
                                             (whatsapp-profiles--presence-label whatsapp-profiles--detail-jid))
+                                           ((eq field 'whatsapp-profile-context)
+                                            (whatsapp-profiles--presence-context whatsapp-profiles--detail-jid))
                                            ((eq field 'whatsapp-profile-photo-status)
                                             (whatsapp-profiles--photo-label whatsapp-profiles--detail-jid))
                                            (t (or (plist-get (gethash (whatsapp-profiles--key whatsapp-profiles--detail-jid)
@@ -695,6 +747,8 @@ A nonzero exit can never publish a ready photo or upstream private values."
           (whatsapp-profiles--decorate-row beg (point) jid))
         (insert (propertize (whatsapp-profiles--safe (whatsapp--chat-name jid)) 'face 'whatsapp-title) "\n\n")
         (insert (propertize "Status unavailable" 'whatsapp-profile-status t 'rear-nonsticky t) "\n\n")
+        (insert (propertize (whatsapp-profiles--presence-context jid)
+                            'whatsapp-profile-context t 'rear-nonsticky t) "\n\n")
         (insert "Photo: " (propertize "Not checked" 'whatsapp-profile-photo-status t 'rear-nonsticky t) "\n\n")
         (insert "About\n" (propertize "About unavailable" 'whatsapp-profile-about t 'rear-nonsticky t) "\n\n")
         (insert (propertize "Identity\n" 'face 'bold) (whatsapp-profiles--safe jid) "\n\n")
@@ -735,12 +789,17 @@ A nonzero exit can never publish a ready photo or upstream private values."
           ((not (display-graphic-p)) "Images need a graphical frame")
           ((whatsapp-profiles--photo key) "Loaded")
           ((eq (plist-get rec :decode-failed) t) "Native PNG display failed")
+          ((equal reason "bridge-auth") "Bridge rejected the selected account token")
+          ((equal reason "bridge-route") "Running bridge lacks the profile route; verify activation")
+          ((equal reason "bridge-busy") "Profile workers busy; Retry photo after pending work finishes")
+          ((equal reason "bridge-network") "Bridge network/request failed")
           ((equal reason "provider-route") "Installed provider lacks this route")
           ((equal reason "provider-rejected") "Provider denied/failed lookup; privacy or session may limit it")
           ((equal reason "cdn-policy") "Photo host is outside the verified CDN policy")
           ((equal reason "cdn-network") "Photo download or validation failed")
           ((equal reason "decoder-unavailable") "FFmpeg missing from Emacs PATH")
           ((equal reason "decoder-failed") "Thumbnail conversion failed")
+          ((equal reason "worker-timeout") "Photo request timed out; check connection, then retry")
           ((equal reason "worker-failed") "Worker failed; check runtime and configuration")
           ((equal (plist-get rec :photo-result) "stale") "Photo changed during loading; use Retry photo")
           (t "Unavailable or still loading; this does not mean blocked"))))

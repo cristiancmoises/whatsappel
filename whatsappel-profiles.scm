@@ -80,7 +80,10 @@
            (cons "activity_age" activity-age)
            (cons "photo_revision" (assoc-ref rec "photo_revision"))
            (cons "photo_state" (assoc-ref rec "photo_state")))
-     (if last-seen (list (cons "last_seen" last-seen)) '()))))
+     (if last-seen (list (cons "last_seen" last-seen)) '())
+     ;; Keep historical observation separately; it is NOT current presence.
+     (let ((seen (and (not group?) (not (string=? state "online")) (assoc-ref rec "last_seen"))))
+       (if seen (list (cons "last_seen_observed" seen)) '())))))
 
 (define (profile-capabilities)
   (json-response 200
@@ -149,7 +152,7 @@
            (list (if (and remove (cdr remove)) "removed" "changed")))))
    (else #f)))
 
-(define (profile-event! o)
+(define* (profile-event! o #:optional (aliases? #t))
   ;; Returns ignored/accepted/invalid. Only previously requested identities retained.
   (let* ((type (jget o "type")) (ev (or (jget o "event") o)))
     (cond
@@ -169,6 +172,24 @@
                 (and stamp-raw
                      (or (not stamp) (< stamp 0) (> stamp (+ (car (gettimeofday)) 60)))))
             'invalid
+            (begin
+              (when aliases?
+                (let ((aliases
+                       (with-mutex *profile-mutex*
+                         (hash-fold (lambda (candidate _rec out)
+                                      (if (and (not (equal? candidate key))
+                                               (equal? (profile-provider-jid candidate)
+                                                       (profile-provider-jid key)))
+                                          (cons candidate out) out)) '() *profile-store*))))
+                  (for-each
+                   (lambda (candidate)
+                     (let* ((identity (cond ((equal? type "Picture") "JID")
+                                            ((equal? type "ChatPresence") "Sender")
+                                            (else "From")))
+                            (copy (acons identity candidate
+                                   (filter (lambda (pair)
+                                             (not (member (car pair) '("From" "from" "Sender" "JID" "jid")))) ev))))
+                       (profile-event! (list (cons "type" type) (cons "event" copy)) #f))) aliases)))
             (with-mutex *profile-mutex*
               (profile-prune!)
               (let ((rec (hash-ref *profile-store* key #f)))
@@ -188,9 +209,20 @@
                     (profile-set! rec "photo_revision" (1+ (assoc-ref rec "photo_revision")))
                     (profile-set! rec "photo_state" (car change))))
                   (when stamp (profile-set! rec stamp-key stamp))
-                  'accepted))))))))))
+                  'accepted)))))))))))
 
-(define (profile-upstream kind key)
+(define (profile-provider-jid key)
+  ;; Metadata only: never change a send recipient or merge chat histories.
+  ;; This map is read from the operator-selected wuzapi database, not guessed.
+  (if (string-suffix? "@lid" key)
+      (let ((phone (hash-ref *lidmap* (substring key 0 (- (string-length key) 4)) #f)))
+        (if (and (string? phone)
+                 (string-match "^[0-9]{3,30}(@s[.]whatsapp[.]net)?$" phone))
+            (normalize-jid phone) key))
+      key))
+
+(define (profile-upstream kind requested-key)
+  (let ((key (profile-provider-jid requested-key)))
   ;; No store mutex is held during upstream I/O. Do not log upstream bodies.
   (let ((path (cond ((member kind '("avatar" "photo")) "/user/avatar")
                     ((equal? kind "about") "/user/info")
@@ -224,6 +256,7 @@
                   (if (and (string? about) (<= (string-length about) 1024))
                       (list (cons "state" "ready") (cons "about" about))
                       '(("state" . "unavailable"))))))))))))
+)
 
 (define (start-profile-job body)
   (let* ((o (and (<= (string-length body) 2048) (safe-json-parse body)))
