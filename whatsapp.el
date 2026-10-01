@@ -5,7 +5,7 @@
 ;;
 ;; Author: Cristian Cezar Moisés
 ;; URL: https://codeberg.org/berkeley/whatsappel
-;; Version: 3.3.0
+;; Version: 3.3.1
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: comm, whatsapp
 
@@ -136,7 +136,7 @@ old captured envelopes; tolerates clock skew and delayed delivery."
 (defvar-local whatsapp-chat--reply nil
   "Pending reply target: plist (:id :participant :text :who), or nil.")
 
-(defconst whatsapp-version "3.3.0" "Workspace release version.")
+(defconst whatsapp-version "3.3.1" "Workspace release version.")
 
 (defconst whatsapp--source-directory
   (file-name-directory (or load-file-name buffer-file-name default-directory)))

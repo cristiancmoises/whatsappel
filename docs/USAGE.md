@@ -50,6 +50,24 @@ already exists; ensure that directory is in PATH.
 On Guix, the launcher uses the selected Emacs profile's image-loader cache to
 avoid mixing incompatible SVG loaders from Home and system profiles.
 
+For an Emacs started from your desktop, the image loader environment must be set
+before Emacs starts. If Emacs belongs to your Guix Home profile, launch it with:
+
+```sh
+export GUIX_GDK_PIXBUF_MODULE_FILES="$HOME/.guix-home/profile/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+exec "$HOME/.guix-home/profile/bin/emacs"
+```
+
+Use `M-: (image-type-available-p 'png)` to check native PNG support. Keep
+`whatsapp-profile-photos` enabled; FFmpeg and Python 3 must be in Emacs's PATH.
+If a user-installed Corfu reports `void-variable corfu-mode--set-explicitly`,
+recompile that package with your current Emacs and restart it.
+
+A provider log reporting `Client outdated` requires a compatible whatsmeow
+update and a reconnect using the saved session. A new QR is needed only if
+WhatsApp actually requires linking. Version 3.3.1 accepts both provider photo URL
+field spellings and avoids repeated date parsing when importing history.
+
 Inside a conversation, type after the prompt. Enter sends; `C-j` adds a newline.
 The visible Send and Attach buttons perform the same actions. Drafts, pending
 replies and reading positions survive history refresh. `C-c ?` opens Commands.

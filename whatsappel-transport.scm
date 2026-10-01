@@ -297,7 +297,7 @@
     (transport-start! 'check #f))
   (json-response 200
     (with-mutex *transport-mutex*
-      (append (list (cons "version" "3.3.0") (cons "checking" *transport-busy*)
+      (append (list (cons "version" "3.3.1") (cons "checking" *transport-busy*)
                     (cons "checked_age" (if (> *transport-last-check* 0) (- (current-time) *transport-last-check*) 'null))
                     (cons "webhooks_seen" *transport-event-count*)
                     (cons "messages_ingested" *transport-message-count*)

@@ -1,4 +1,4 @@
-# WhatsAppel 3.3.0
+# WhatsAppel 3.3.1
 
 Cliente WhatsApp nativo para GNU Emacs, com bridge Guile, workers Python limitados
 e wuzapi/whatsmeow. Fotos de contatos, arquivamento confirmado e ferramentas nativas de conversa.
@@ -19,9 +19,9 @@ A versão inclui as correções RC18–20. Os arquivos de distribuição usam `.
 
 ```sh
 sha256sum -c SHA256SUMS
-zupt test whatsappel-3.3.0.zupt
-zupt extract -o extracted whatsappel-3.3.0.zupt
-cd extracted/whatsappel-3.3.0
+zupt test whatsappel-3.3.1.zupt
+zupt extract -o extracted whatsappel-3.3.1.zupt
+cd extracted/whatsappel-3.3.1
 fish scripts/update-and-activate.fish "$HOME/whatsappel" --restart-local
 ```
 
@@ -92,7 +92,7 @@ o trabalho e reinicie completamente o Emacs, inclusive o daemon.
 ![Mídia em conversa](docs/screenshots/whatsappel-media.png)
 
 São as capturas anteriormente aprovadas, sem novas alterações. Não representam
-validação visual do 3.3.0. O relatório de validação é distribuído separadamente.
+validação visual do 3.3.1. O relatório de validação é distribuído separadamente.
 
 `python3 -I scripts/audit-workspace.py . --scope full` executa a auditoria completa.
 `make check` inclui as regressões nativas. Testes simulados não comprovam entrega

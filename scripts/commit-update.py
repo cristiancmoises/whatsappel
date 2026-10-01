@@ -41,7 +41,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("repository", nargs="?", type=Path, default=Path.home() / "whatsappel")
     p.add_argument("--bundle", type=Path, default=Path(__file__).resolve().parents[1])
-    p.add_argument("--worktree", type=Path, default=Path.home() / "whatsappel-publish-3.3.0")
+    p.add_argument("--worktree", type=Path, default=Path.home() / "whatsappel-publish-3.3.1")
     p.add_argument("--branch", default="main", help="Destination branch, never force-pushed")
     p.add_argument("--create-missing", action="store_true")
     p.add_argument("--visibility", choices=("public", "private"))
@@ -86,15 +86,15 @@ def main(argv=None):
         return 0
     if not work.exists():
         if source_git:
-            git(source, "worktree", "add", "-b", "whatsappel-3.3.0", str(work), "HEAD")
+            git(source, "worktree", "add", "-b", "whatsappel-3.3.1", str(work), "HEAD")
             print("Publication starts from committed HEAD. Uncommitted changes in your original checkout are not included or modified.", flush=True)
         else:
             print("Installation is not a Git checkout. Creating a separate public Codeberg clone; original installation is unchanged.", flush=True)
             git(work.parent, "-c", "credential.helper=", "-c", "http.followRedirects=false", "clone", "--", "https://codeberg.org/berkeley/whatsappel.git", str(work), isolated=True)
-            git(work, "switch", "-c", "whatsappel-3.3.0")
+            git(work, "switch", "-c", "whatsappel-3.3.1")
     if git(work, "rev-parse", "--show-toplevel").stdout.strip() != str(work):
         raise ValueError("Publication path must be the exact repository root")
-    if git(work, "symbolic-ref", "--short", "HEAD").stdout.strip() != "whatsappel-3.3.0":
+    if git(work, "symbolic-ref", "--short", "HEAD").stdout.strip() != "whatsappel-3.3.1":
         raise ValueError("Publication worktree is on a different branch; no changes made")
     allowed = {item["path"] for item in spec["files"]}
     changed = set(git(work, "diff", "HEAD", "--name-only", "-z").stdout.split("\0")) - {""}
@@ -114,7 +114,7 @@ def main(argv=None):
     if staged - allowed:
         raise ValueError("Unexpected staged paths; nothing committed")
     if staged:
-        git(work, "commit", "-m", "Add contact photos, archive controls and native conversation tools", "-m", "Prepare 3.3.0 with confirmed archive operations, local pins and graphical-frame photo rendering. Preserve two-pass native validation, account state and unknown edits. Never equate accepted messages with delivery.", identity=(name, email))
+        git(work, "commit", "-m", "Add contact photos, archive controls and native conversation tools", "-m", "Prepare 3.3.1 with confirmed archive operations, local pins and graphical-frame photo rendering. Preserve two-pass native validation, account state and unknown edits. Never equate accepted messages with delivery.", identity=(name, email))
     commit = git(work, "rev-parse", "HEAD").stdout.strip()
     print("Publication checkout: " + str(work) + "\nCommit: " + commit, flush=True)
     if a.commit_only:

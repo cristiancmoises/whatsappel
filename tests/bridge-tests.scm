@@ -35,6 +35,22 @@
   (map record-id (sort (list (rec "b" "1" "10") (rec "a" "1" "9")) record-before?)))
 (test-equal "RFC3339 offsets normalize" (parse-timestamp "2026-09-09T15:00:00Z")
   (parse-timestamp "2026-09-09T12:00:00.123-03:00"))
+(let* ((original timestamp-value) (calls 0)
+       (records (map (lambda (i) (rec (number->string i) "123" i)) (reverse (iota 96)))))
+  (dynamic-wind
+    (lambda () (set! timestamp-value (lambda (record) (set! calls (1+ calls)) (original record))))
+    (lambda ()
+      (test-equal "history merge retains chronological order"
+        (map number->string (iota 96)) (map record-id (merge-records '() records)))
+      (test-assert "history sorting parses each timestamp at most once" (<= calls 96)))
+    (lambda () (set! timestamp-value original))))
+(let ((records (list (rec "c" "123" "2026-09-09T12:00:00-03:00")
+                     (rec "a" "123" "2026-09-09T15:00:00Z")
+                     (rec "early" "123" "2026-09-09T14:59:59Z"))))
+  (test-equal "cached time keys keep timezone equivalence and ID tie order"
+    '("early" "a" "c") (map record-id (sort-timestamped records)))
+  (test-equal "newest-first time keys retain ascending ID ties"
+    '("a" "c" "early") (map record-id (sort-timestamped records #t))))
 (test-equal "base64 decoded size and MIME" '("image/png" 1) (data-uri-info "data:image/png;base64,AA=="))
 (for-each (lambda (v) (test-assert (format #f "malformed media ~s" v) (not (data-uri-info v))))
           '("http://localhost/private" "data:image/png;base64," "data:image/png;base64,A==="

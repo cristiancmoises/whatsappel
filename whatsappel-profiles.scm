@@ -245,7 +245,7 @@
          (else
           (let ((data (or (jget parsed "data") parsed)))
             (if (member kind '("avatar" "photo"))
-                (let ((url (jget data "URL")))
+                (let ((url (or (jget data "url") (jget data "URL"))))
                   ;; Client worker applies the stricter exact-host/DNS/TLS policy.
                   (if (valid-download-url? url)
                       (list (cons "state" "ready") (cons "url" url))

@@ -1,4 +1,4 @@
-# WhatsAppel 3.3.0
+# WhatsAppel 3.3.1
 
 Native WhatsApp workspace for GNU Emacs, with a Guile bridge, bounded Python
 workers and the wuzapi/whatsmeow provider. Contact photos, confirmed archive controls and native conversation tools.
@@ -50,14 +50,14 @@ boundaries, original send-recipient identities and the no-resend policy remain.
 
 ## Existing GNU Guix installation
 
-Download `whatsappel-3.3.0.zupt` and `SHA256SUMS` from the release, then verify and
+Download `whatsappel-3.3.1.zupt` and `SHA256SUMS` from the release, then verify and
 extract the archive using [ZUPT](https://github.com/cristiancmoises/zupt):
 
 ```sh
 sha256sum -c SHA256SUMS
-zupt test whatsappel-3.3.0.zupt
-zupt extract -o extracted whatsappel-3.3.0.zupt
-cd extracted/whatsappel-3.3.0
+zupt test whatsappel-3.3.1.zupt
+zupt extract -o extracted whatsappel-3.3.1.zupt
+cd extracted/whatsappel-3.3.1
 ```
 
 Within the extracted bundle:
@@ -83,7 +83,7 @@ to copy the whole tree over private state. Unknown runtime edits are refused.
 ![Inline images](docs/screenshots/whatsappel-image-view.png)
 ![Conversation media](docs/screenshots/whatsappel-media.png)
 
-These are the previously approved screenshots; they are not new 3.3.0 acceptance
+These are the previously approved screenshots; they are not new 3.3.1 acceptance
 results. Image files are unchanged from the approved clean distribution.
 
 ## Validation

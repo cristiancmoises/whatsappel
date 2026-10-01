@@ -1,5 +1,15 @@
 # Changelog
 
+## 3.3.1 — live contact photos and responsive history
+
+- Accept the provider's lowercase `url` photo field while retaining legacy `URL`
+  support, with native avatar/full-photo contract tests.
+- Parse timestamps once per sorting pass and reuse the RFC3339 regular expression.
+  Preserve chronological order, timezone equivalence and deterministic ID ties.
+- Verify real contact avatars and a full photo in graphical GNU Guix Emacs.
+  Refresh outdated whatsmeow providers while retaining their saved device identity.
+- Document the Guix image loader environment and Emacs configuration requirements.
+
 ## 3.3.0 — contact photos and conversation organization
 
 - Render and schedule contact photos for any visible graphical Emacs frame,

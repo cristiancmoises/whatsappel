@@ -302,11 +302,14 @@
 (define (valid-epoch? value)
   (and (real? value) (finite? value) (<= 0 value 253402300799)))
 
+(define *timestamp-pattern*
+  (make-regexp "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})$"))
+
 (define (parse-timestamp ts)
   (cond ((valid-epoch? ts) ts)
         ((not (string? ts)) #f)
         ((let ((n (string->number ts))) (and (valid-epoch? n) n)) => identity)
-        ((string-match "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})$" ts)
+        ((regexp-exec *timestamp-pattern* ts)
          => (lambda (match)
               (catch #t
                 (lambda ()
@@ -323,6 +326,16 @@
 (define (record-before? a b)
   (let ((ta (timestamp-value a)) (tb (timestamp-value b)))
     (if (= ta tb) (string<? (or (record-id a) "") (or (record-id b) "")) (< ta tb))))
+
+(define* (sort-timestamped records #:optional (descending? #f) (key record-id))
+  ;; Compute expensive RFC3339 keys once; return the original record objects.
+  (map caddr
+       (sort (map (lambda (record)
+                    (list (timestamp-value record) (or (key record) "") record)) records)
+             (lambda (a b)
+               (if (= (car a) (car b))
+                   (string<? (cadr a) (cadr b))
+                   (if descending? (> (car a) (car b)) (< (car a) (car b))))))))
 
 (define (trim-chats! incoming)
   ;; Evict the least recently active chat as one unit, including auxiliary maps.
@@ -360,8 +373,8 @@
                                 merged))))
                       (set! anonymous (cons rec anonymous)))))
               (append current incoming))
-    (take-last (sort (hash-fold (lambda (id rec out) (cons rec out)) anonymous seen)
-                     record-before?) *chat-cap*)))
+    (take-last (sort-timestamped (hash-fold (lambda (id rec out) (cons rec out)) anonymous seen))
+               *chat-cap*)))
 
 (define (store-record! chat rec inbound?)
   (with-mutex *smutex*
@@ -611,7 +624,7 @@
              (good (filter (lambda (r) (and (parse-timestamp (jget r "ts"))
                                           (valid-target? (jget r "id"))
                                           (optional-string? (jget r "text") *max-text-length*))) recs))
-             (sorted (sort good record-before?)))
+             (sorted (sort-timestamped good)))
         (when (pair? sorted)
           (with-mutex *smutex*
             (let ((key (normalize-jid jid)))
@@ -983,9 +996,7 @@
          *chats*)
         (set! *read-summary-cache*
               (list->vector
-               (sort out (lambda (a b)
-                           (let ((ta (timestamp-value a)) (tb (timestamp-value b)))
-                             (if (= ta tb) (string<? (jget a "jid") (jget b "jid")) (> ta tb)))))))
+               (sort-timestamped out #t (lambda (record) (jget record "jid")))))
         *read-summary-cache*)))
 
 (define* (handle-chats #:optional query)
@@ -1129,7 +1140,7 @@
     (cond
      ((and (eq? method 'GET) (string=? path "/health"))
       (json-response 200 '(("status" . "ok") ("service" . "whatsappel") ("read_api" . 2) ("async_media" . #t)
-                            ("version" . "3.3.0") ("transport_api" . 1) ("verified_send" . 1) ("session_connect" . 1))))
+                            ("version" . "3.3.1") ("transport_api" . 1) ("verified_send" . 1) ("session_connect" . 1))))
      ((and (eq? method 'POST) (ct-string=? path *hook-path*))
       (handle-webhook (webhook-body-string headers body)))
      ((not (authed? headers))

@@ -125,6 +125,24 @@ class ProfileHTTPTests(unittest.TestCase):
         req=self.backend.matching_requests('/user/avatar')[0]
         self.assertEqual(req[0],'POST');self.assertTrue(req[2]['Preview']);self.assertEqual(req[3],base.UPSTREAM_TOKEN)
 
+    def test_provider_lowercase_photo_fields(self):
+        self.snapshot()
+        with self.backend.lock:
+            self.backend.responses['/user/avatar'] = (200, {
+                'success': True, 'data': {
+                    'url': 'https://pps.whatsapp.net/synthetic',
+                    'id': '1', 'type': 'preview', 'direct_path': '/synthetic', 'hash': None}})
+        for kind in ('avatar', 'photo'):
+            with self.subTest(kind=kind):
+                code, job = self.submit(kind)
+                self.assertEqual(code, 202)
+                code, result = self.result(job['job'])
+                self.assertEqual(code, 200)
+                self.assertEqual(result['state'], 'ready')
+                self.assertEqual(result['url'], 'https://pps.whatsapp.net/synthetic')
+        requests = self.backend.matching_requests('/user/avatar')
+        self.assertEqual([request[2]['Preview'] for request in requests], [True, False])
+
     def test_about_is_not_presence_or_stories(self):
         self.snapshot();code,obj=self.submit('about');self.assertEqual(code,202)
         result=self.result(obj['job'])[1];self.assertEqual(result['about'],'Fixture About')

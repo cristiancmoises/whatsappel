@@ -24,6 +24,24 @@ Abra `M-x whatsapp` ou `M-x whatsappel` a partir da 3.3. Em versões anteriores,
 adicione `(defalias 'whatsappel #'whatsapp)` após o `require`. Depois de `git pull`,
 reinicie o Emacs para carregar o código atualizado.
 
+No Emacs aberto pelo desktop do Guix, configure os carregadores de imagens antes
+de iniciar o processo. Para o Emacs do perfil Guix Home:
+
+```sh
+export GUIX_GDK_PIXBUF_MODULE_FILES="$HOME/.guix-home/profile/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+exec "$HOME/.guix-home/profile/bin/emacs"
+```
+
+Confira `M-: (image-type-available-p 'png)`. Mantenha `whatsapp-profile-photos`
+ativado e disponibilize Python 3 e FFmpeg no PATH do Emacs. Se o Corfu instalado
+pelo usuário informar `void-variable corfu-mode--set-explicitly`, recompile esse
+pacote com o Emacs atual e reinicie o editor.
+
+Se o provedor registrar `Client outdated`, atualize a biblioteca whatsmeow e
+reconecte a sessão salva. Abra um novo QR somente quando o WhatsApp exigir
+vinculação. A versão 3.3.1 aceita as duas grafias do campo de URL da foto e evita
+analisar repetidamente as datas durante a importação do histórico.
+
 Alias de terminal no Fish:
 
 ```fish
